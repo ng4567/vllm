@@ -7,13 +7,15 @@ import torch
 from vllm import _custom_ops as ops
 from vllm.attention import AttentionBackend
 from vllm.logger import init_logger
-from vllm.utils.platform_utils import is_pin_memory_available
-from vllm.v1.kv_offload.mediums import CPULoadStoreSpec, GPULoadStoreSpec
+from vllm.v1.kv_offload.mediums import DestGPULoadStoreSpec, GPULoadStoreSpec
 from vllm.v1.kv_offload.worker.worker import (
     OffloadingHandler,
     TransferResult,
     TransferSpec,
 )
+
+# Global variable to store handler instance
+_global_handler_instance = None
 
 logger = init_logger(__name__)
 
@@ -51,54 +53,69 @@ def expand_block_ids(
         output_idx = output_end_idx
 
 
-class CpuGpuOffloadingHandler(OffloadingHandler):
+class GpuGpuOffloadingHandler(OffloadingHandler):
     def __init__(
         self,
-        gpu_block_size: int,
-        cpu_block_size: int,
-        num_cpu_blocks: int,
+        src_block_size: int,
+        dest_block_size: int,
+        num_gpu_blocks: int,
         gpu_caches: dict[str, torch.Tensor],
         attn_backends: dict[str, type[AttentionBackend]],
+        src_gpu_id: int = 0,
+        dest_gpu_id: int = 1,
     ):
-        # Initialize counters for stats tracking
+        # Store this instance globally
+        global _global_handler_instance
+        _global_handler_instance = self
+        
+        # Initialize counters
         self.blocks_offloaded: int = 0
         self.blocks_reloaded: int = 0
         self.blocks_evicted: int = 0
         self.blocks_freed: int = 0
         self.blocks_allocated: int = 0
 
-        assert cpu_block_size % gpu_block_size == 0
-        self.block_size_factor = cpu_block_size // gpu_block_size
+        assert dest_block_size % src_block_size == 0
+        self.block_size_factor = dest_block_size // src_block_size
 
-        # cuda streams for gpu->cpu and cpu->gpu
-        self.d2h_stream = torch.cuda.Stream()
-        self.h2d_stream = torch.cuda.Stream()
+        self.src_gpu_id = src_gpu_id
+        self.dest_gpu_id = dest_gpu_id
 
-        # job_id -> transfer cuda event
-        self.transfer_events: dict[int, torch.Event] = {}
-        # list of cuda events available for re-use
-        self.events_pool: list[torch.Event] = []
+        # cuda streams for gpu_src->gpu_dest and gpu_dest->gpu_src
+        with torch.cuda.device(src_gpu_id):
+            self.gpu_src_to_dest_stream = torch.cuda.Stream()
+        with torch.cuda.device(dest_gpu_id):
+            self.gpu_dest_to_src_stream = torch.cuda.Stream()
 
-        pin_memory = is_pin_memory_available()
+        # job_id -> (event, device_id)
+        self.transfer_events: dict[int, tuple[torch.cuda.Event, int]] = {}
+        # list of cuda events available for re-use, keyed by device
+        self.events_pool: dict[int, list[torch.cuda.Event]] = {
+            src_gpu_id: [],
+            dest_gpu_id: [],
+        }
 
-        # allocate cpu tensors
-        logger.info("Allocating %d CPU tensors...", len(gpu_caches))
-        self.gpu_tensors: list[torch.Tensor] = []
-        self.cpu_tensors: list[torch.Tensor] = []
+        # allocate dest gpu tensors
+        logger.info("Allocating %d secondary GPU tensors on cuda:%d...", 
+                   len(gpu_caches), dest_gpu_id)
+        
+        self.src_gpu_tensors: list[torch.Tensor] = []
+        self.dest_gpu_tensors: list[torch.Tensor] = []
         self.kv_dim_before_num_blocks: list[bool] = []
+        
         for layer_name, gpu_tensor in gpu_caches.items():
-            self.gpu_tensors.append(gpu_tensor)
+            self.src_gpu_tensors.append(gpu_tensor)
 
-            gpu_shape = gpu_tensor.shape
+            src_gpu_shape = gpu_tensor.shape
             attn_backend = attn_backends[layer_name]
             test_shape = attn_backend.get_kv_cache_shape(
                 num_blocks=1234, block_size=16, num_kv_heads=8, head_size=256
             )
 
-            if len(gpu_shape) != len(test_shape):
+            if len(src_gpu_shape) != len(test_shape):
                 # cross-layers tensor
                 # shape is (num_blocks, ...)
-                assert len(gpu_shape) == len(test_shape) + 1
+                assert len(src_gpu_shape) == len(test_shape) + 1
                 num_blocks_idx = 0
                 self.kv_dim_before_num_blocks.append(False)
             elif test_shape[0] == 1234:
@@ -109,54 +126,67 @@ class CpuGpuOffloadingHandler(OffloadingHandler):
                 # shape should be (2, num_blocks, ...)
                 assert test_shape[0] == 2
                 assert test_shape[1] == 1234
-                assert gpu_shape[0] == 2
+                assert src_gpu_shape[0] == 2
 
                 num_blocks_idx = 1
                 self.kv_dim_before_num_blocks.append(True)
 
-            cpu_shape = list(gpu_shape)
-            cpu_shape[num_blocks_idx] = num_cpu_blocks * self.block_size_factor
+            dest_gpu_shape = list(src_gpu_shape)
+            dest_gpu_shape[num_blocks_idx] = num_gpu_blocks * self.block_size_factor
 
-            logger.debug("Allocating CPU tensor of shape %r", cpu_shape)
-            self.cpu_tensors.append(
+            logger.debug("Allocating secondary GPU tensor of shape %r on cuda:%d", 
+                        dest_gpu_shape, dest_gpu_id)
+
+            self.dest_gpu_tensors.append(
                 torch.zeros(
-                    cpu_shape,
+                    dest_gpu_shape,
                     dtype=gpu_tensor.dtype,
-                    device="cpu",
-                    pin_memory=pin_memory,
+                    device=f"cuda:{dest_gpu_id}",
                 )
             )
 
     def transfer_async(self, job_id: int, spec: TransferSpec) -> bool:
         src_spec, dst_spec = spec
-        if isinstance(src_spec, CPULoadStoreSpec):
-            assert isinstance(dst_spec, GPULoadStoreSpec)
-            direction = "RELOAD"
-            stream = self.h2d_stream
-            src_tensors = self.cpu_tensors
-            dst_tensors = self.gpu_tensors
-            src_block_size_factor = self.block_size_factor
-            dst_block_size_factor = 1
-            self.blocks_reloaded += len(src_spec.block_ids)
-        else:
-            assert isinstance(src_spec, GPULoadStoreSpec)
-            assert isinstance(dst_spec, CPULoadStoreSpec)
+        
+        # Determine direction and update counters
+        if isinstance(src_spec, GPULoadStoreSpec):
+            assert isinstance(dst_spec, DestGPULoadStoreSpec)
             direction = "OFFLOAD"
-            stream = self.d2h_stream
-            src_tensors = self.gpu_tensors
-            dst_tensors = self.cpu_tensors
+            stream = self.gpu_src_to_dest_stream
+            event_device = self.src_gpu_id  # event on source device
+            src_tensors = self.src_gpu_tensors
+            dst_tensors = self.dest_gpu_tensors
             src_block_size_factor = 1
             dst_block_size_factor = self.block_size_factor
+            # Update offload counter
             self.blocks_offloaded += len(src_spec.block_ids)
+        else:
+            assert isinstance(src_spec, DestGPULoadStoreSpec)
+            assert isinstance(dst_spec, GPULoadStoreSpec)
+            direction = "RELOAD"
+            stream = self.gpu_dest_to_src_stream
+            event_device = self.dest_gpu_id  # event on source device (dest GPU)
+            src_tensors = self.dest_gpu_tensors
+            dst_tensors = self.src_gpu_tensors
+            src_block_size_factor = self.block_size_factor
+            dst_block_size_factor = 1
+            # Update reload counter
+            self.blocks_reloaded += len(src_spec.block_ids)
 
         src_blocks = src_spec.block_ids
-        print(f"[KV TRANSFER] {direction} GPU↔CPU | "
-              f"Job {job_id} | Blocks: {len(src_blocks)} | "
-              f"IDs: {src_blocks[:5].tolist()}{'...' if len(src_blocks) > 5 else ''}")
-
         dst_blocks = dst_spec.block_ids
+
         assert src_blocks.ndim == 1
         assert dst_blocks.ndim == 1
+
+        if direction == "OFFLOAD":
+            print(f"[KV TRANSFER] {direction} GPU{self.src_gpu_id}→GPU{self.dest_gpu_id} | "
+                  f"Job {job_id} | Blocks: {len(src_blocks)} | "
+                  f"IDs: {src_blocks[:5].tolist()}{'...' if len(src_blocks) > 5 else ''}")
+        else:
+            print(f"[KV TRANSFER] {direction} GPU{self.dest_gpu_id}→GPU{self.src_gpu_id} | "
+                  f"Job {job_id} | Blocks: {len(src_blocks)} | "
+                  f"IDs: {src_blocks[:5].tolist()}{'...' if len(src_blocks) > 5 else ''}")
 
         src_sub_block_count = src_blocks.size * src_block_size_factor
         dst_sub_block_count = dst_blocks.size * dst_block_size_factor
@@ -174,39 +204,46 @@ class CpuGpuOffloadingHandler(OffloadingHandler):
         expand_block_ids(dst_blocks, dst_block_size_factor, src_to_dst[:, 1])
         src_to_dst_tensor = torch.from_numpy(src_to_dst)
 
-        event = self.events_pool.pop() if self.events_pool else torch.Event()
+        # Get or create event on the correct device
+        pool = self.events_pool[event_device]
+        if pool:
+            event = pool.pop()
+        else:
+            with torch.cuda.device(event_device):
+                event = torch.cuda.Event()
+        
         with torch.cuda.stream(stream):
             for src_tensor, dst_tensor, kv_dim in zip(
                 src_tensors, dst_tensors, self.kv_dim_before_num_blocks
             ):
                 if kv_dim:
-                    src_key_cache = src_tensor[0]
-                    dst_key_cache = dst_tensor[0]
-                    ops.swap_blocks(src_key_cache, dst_key_cache, src_to_dst_tensor)
-                    src_value_cache = src_tensor[1]
-                    dst_value_cache = dst_tensor[1]
-                    ops.swap_blocks(src_value_cache, dst_value_cache, src_to_dst_tensor)
+                    for kv_idx in range(2):  # 0=key, 1=value
+                        src_cache = src_tensor[kv_idx]
+                        dst_cache = dst_tensor[kv_idx]
+
+                        for src_block_id, dst_block_id in src_to_dst:
+                            dst_cache[dst_block_id].copy_(src_cache[src_block_id], non_blocking=True)
                 else:
-                    ops.swap_blocks(src_tensor, dst_tensor, src_to_dst_tensor)
+                    for src_block_id, dst_block_id in src_to_dst:
+                        dst_tensor[dst_block_id].copy_(src_tensor[src_block_id], non_blocking=True)
             event.record(stream)
 
-        self.transfer_events[job_id] = event
+        self.transfer_events[job_id] = (event, event_device)
 
         # success
         return True
 
     def get_finished(self) -> list[TransferResult]:
         results: list[TransferResult] = []
-        for job_id, event in self.transfer_events.items():
+        for job_id, (event, device) in self.transfer_events.items():
             if event.query():
                 results.append((job_id, True))
-                self.events_pool.append(event)
+                self.events_pool[device].append(event)
         for job_id, _ in results:
             del self.transfer_events[job_id]
         return results
 
     def get_offloading_stats(self) -> dict[str, int]:
-        """Return current offloading statistics."""
         return {
             "blocks_offloaded": self.blocks_offloaded,
             "blocks_reloaded": self.blocks_reloaded,
@@ -214,3 +251,12 @@ class CpuGpuOffloadingHandler(OffloadingHandler):
             "blocks_evicted": self.blocks_evicted,
             "blocks_freed": self.blocks_freed,
         }
+
+
+# Module-level function to access stats
+def get_global_stats() -> dict | None:
+    """Get stats from the global handler instance."""
+    global _global_handler_instance
+    if _global_handler_instance:
+        return _global_handler_instance.get_offloading_stats()
+    return None

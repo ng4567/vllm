@@ -506,6 +506,11 @@ class Worker(WorkerBase):
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.model_runner.get_supported_tasks()
 
+    def get_offloading_stats(self):
+        if hasattr(self.model_runner, "get_offloading_stats"):
+            return self.model_runner.get_offloading_stats()
+        return None
+
     def annotate_profile(self, scheduler_output):
         # add trace annotation so that we can easily distinguish
         # new/cached request numbers in each iteration

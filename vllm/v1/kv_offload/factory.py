@@ -52,5 +52,8 @@ class OffloadingSpecFactory:
 
 # Register various specs here.
 OffloadingSpecFactory.register_spec(
-    "CPUOffloadingSpec", "vllm.v1.kv_offload.cpu", "CPUOffloadingSpec"
+    "CPUOffloadingSpec", "vllm.v1.kv_offload.cpu", "CPUOffloadingSpec",
+)
+OffloadingSpecFactory.register_spec(
+    "GPUOffloadingSpec", "vllm.v1.kv_offload.gpu", "GPUOffloadingSpec"
 )

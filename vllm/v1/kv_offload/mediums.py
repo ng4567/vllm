@@ -28,6 +28,15 @@ class GPULoadStoreSpec(BlockIDsLoadStoreSpec):
     def medium() -> str:
         return "GPU"
 
+class DestGPULoadStoreSpec(BlockIDsLoadStoreSpec):
+    """
+    Spec for loading/storing a KV block to Destination GPU's memory.
+    """
+
+    @staticmethod
+    def medium() -> str:
+        return "SECONDARY_GPU"
+
 
 class CPULoadStoreSpec(BlockIDsLoadStoreSpec):
     """

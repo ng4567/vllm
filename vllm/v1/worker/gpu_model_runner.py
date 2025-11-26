@@ -3366,6 +3366,10 @@ class GPUModelRunner(
             new_config = update_config(config, config_overrides)
             setattr(self, config_name, new_config)
 
+    def get_offloading_stats(self):
+        """Expose KV offloading stats available via the connector."""
+        return KVConnectorModelRunnerMixin.get_kv_offloading_stats()
+
     def load_model(self, eep_scale_up: bool = False) -> None:
         """
         Args:

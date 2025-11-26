@@ -97,6 +97,12 @@ class OffloadingConnector(KVConnectorBase_V1):
         assert self.connector_worker is not None
         return self.connector_worker.get_finished(finished_req_ids)
 
+    def get_offloading_stats(self):
+        """Expose worker-side offloading statistics."""
+        if self.connector_worker:
+            return self.connector_worker.get_offloading_stats()
+        return None
+
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
     ) -> tuple[int, bool]:
@@ -134,6 +140,9 @@ class OffloadingConnector(KVConnectorBase_V1):
     def take_events(self) -> Iterable[KVCacheEvent]:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.take_events()
+
+    def get_offloading_stats(self):
+        return self.connector_worker.get_offloading_stats()
 
 
 class OffloadingConnectorScheduler:
@@ -516,6 +525,11 @@ class OffloadingConnectorWorker:
 
         return finished_sending, finished_recving
 
+    def get_offloading_stats(self):
+        """Return handler stats exposed by the backend spec."""
+        if hasattr(self.spec, "get_handler_stats"):
+            return self.spec.get_handler_stats()
+        return None
 
 def yield_req_data(
     scheduler_output,

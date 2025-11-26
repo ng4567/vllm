@@ -150,6 +150,15 @@ class KVConnectorModelRunnerMixin:
         return None
 
     @staticmethod
+    def get_kv_offloading_stats() -> dict | None:
+        """Return offloading stats exposed by the KV connector, if any."""
+        if has_kv_transfer_group():
+            kv_connector = get_kv_transfer_group()
+            if hasattr(kv_connector, "get_offloading_stats"):
+                return kv_connector.get_offloading_stats()
+        return None
+
+    @staticmethod
     def use_uniform_kv_cache(
         attn_groups: list[list[AttentionGroup]],
         cache_dtype: CacheDType,
