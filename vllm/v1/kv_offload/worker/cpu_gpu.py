@@ -150,9 +150,10 @@ class CpuGpuOffloadingHandler(OffloadingHandler):
             self.blocks_offloaded += len(src_spec.block_ids)
 
         src_blocks = src_spec.block_ids
-        print(f"[KV TRANSFER] {direction} GPU↔CPU | "
-              f"Job {job_id} | Blocks: {len(src_blocks)} | "
-              f"IDs: {src_blocks[:5].tolist()}{'...' if len(src_blocks) > 5 else ''}")
+        # Debug logging (commented out for cleaner benchmark output)
+        # print(f"[KV TRANSFER] {direction} GPU↔CPU | "
+        #       f"Job {job_id} | Blocks: {len(src_blocks)} | "
+        #       f"IDs: {src_blocks[:5].tolist()}{'...' if len(src_blocks) > 5 else ''}")
 
         dst_blocks = dst_spec.block_ids
         assert src_blocks.ndim == 1

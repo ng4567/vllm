@@ -179,14 +179,15 @@ class GpuGpuOffloadingHandler(OffloadingHandler):
         assert src_blocks.ndim == 1
         assert dst_blocks.ndim == 1
 
-        if direction == "OFFLOAD":
-            print(f"[KV TRANSFER] {direction} GPU{self.src_gpu_id}→GPU{self.dest_gpu_id} | "
-                  f"Job {job_id} | Blocks: {len(src_blocks)} | "
-                  f"IDs: {src_blocks[:5].tolist()}{'...' if len(src_blocks) > 5 else ''}")
-        else:
-            print(f"[KV TRANSFER] {direction} GPU{self.dest_gpu_id}→GPU{self.src_gpu_id} | "
-                  f"Job {job_id} | Blocks: {len(src_blocks)} | "
-                  f"IDs: {src_blocks[:5].tolist()}{'...' if len(src_blocks) > 5 else ''}")
+        # Debug logging (commented out for cleaner benchmark output)
+        # if direction == "OFFLOAD":
+        #     print(f"[KV TRANSFER] {direction} GPU{self.src_gpu_id}→GPU{self.dest_gpu_id} | "
+        #           f"Job {job_id} | Blocks: {len(src_blocks)} | "
+        #           f"IDs: {src_blocks[:5].tolist()}{'...' if len(src_blocks) > 5 else ''}")
+        # else:
+        #     print(f"[KV TRANSFER] {direction} GPU{self.dest_gpu_id}→GPU{self.src_gpu_id} | "
+        #           f"Job {job_id} | Blocks: {len(src_blocks)} | "
+        #           f"IDs: {src_blocks[:5].tolist()}{'...' if len(src_blocks) > 5 else ''}")
 
         src_sub_block_count = src_blocks.size * src_block_size_factor
         dst_sub_block_count = dst_blocks.size * dst_block_size_factor
