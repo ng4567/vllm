@@ -5,7 +5,7 @@ import csv
 import torch
 from vllm import LLM, SamplingParams
 from vllm.config.kv_transfer import KVTransferConfig
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoConfig
 from gpu_gpu_kv_offload_test import *
 from memory_calculator import *
 from collections import defaultdict
@@ -15,7 +15,6 @@ huggingface_api_key = os.getenv("hf_token")
 BLOCK_SIZE = 16
 EVICTION_POLICY = "arc"
 DEST_GPU_ID = 1
-NUM_BLOCKS = 20000
 NUM_TRIALS = 1
 
 STAT_KEYS = [
@@ -25,6 +24,65 @@ STAT_KEYS = [
     "blocks_evicted",
     "blocks_freed",
 ]
+
+
+def calculate_max_offload_blocks(
+    dest_gpu_id: int,
+    model_name: str,
+    block_size: int = 16,
+    headroom_fraction: float = 0.1,
+    dtype_bytes: int = 2,  # bfloat16/float16
+) -> int:
+    """
+    Calculate maximum number of KV cache blocks that can fit on the destination GPU.
+    
+    Args:
+        dest_gpu_id: GPU ID to offload to
+        model_name: HuggingFace model name to get config from
+        block_size: Number of tokens per block
+        headroom_fraction: Fraction of memory to leave free (default 10%)
+        dtype_bytes: Bytes per element (2 for fp16/bf16, 4 for fp32)
+    
+    Returns:
+        Maximum number of blocks that can fit on the destination GPU
+    """
+    # Get model config to determine KV cache dimensions
+    config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+    
+    num_layers = config.num_hidden_layers
+    num_kv_heads = getattr(config, 'num_key_value_heads', config.num_attention_heads)
+    head_dim = config.hidden_size // config.num_attention_heads
+    
+    # Calculate bytes per KV cache block
+    # Each block stores: 2 (K+V) × num_kv_heads × head_dim × num_layers × dtype_bytes × block_size
+    bytes_per_block = 2 * num_kv_heads * head_dim * num_layers * dtype_bytes * block_size
+    
+    # Get available memory on destination GPU
+    torch.cuda.synchronize(dest_gpu_id)
+    free_bytes, total_bytes = torch.cuda.mem_get_info(dest_gpu_id)
+    
+    # Leave headroom
+    usable_bytes = free_bytes * (1 - headroom_fraction)
+    
+    max_blocks = int(usable_bytes / bytes_per_block)
+    
+    print(f"\n=== Max Offload Blocks Calculation ===")
+    print(f"Model: {model_name}")
+    print(f"  Layers: {num_layers}, KV Heads: {num_kv_heads}, Head Dim: {head_dim}")
+    print(f"  Block size: {block_size} tokens")
+    print(f"  Bytes per block: {bytes_per_block / 1024:.1f} KB")
+    print(f"Destination GPU {dest_gpu_id}:")
+    print(f"  Total: {total_bytes / 1e9:.1f} GB")
+    print(f"  Free: {free_bytes / 1e9:.1f} GB")
+    print(f"  Usable (with {headroom_fraction:.0%} headroom): {usable_bytes / 1e9:.1f} GB")
+    print(f"  Max offload blocks: {max_blocks:,}")
+    print(f"======================================\n")
+    
+    return max_blocks
+
+
+# Will be computed per model
+NUM_BLOCKS = 10000  # Default, will be updated per model
 
 # ============================================================
 # Prompt Sets
@@ -164,9 +222,23 @@ def generate_configs(models: dict[str, float]) -> dict:
 # Will be populated by generate_configs() in main
 configs = {}
 
+# Cache for max blocks per model (calculated once per model)
+_max_blocks_cache: dict[str, int] = {}
+
 def init_configs() -> None:
     for config_name, config in configs.items():
         print(f"Initializing Config: {config_name}")
+        
+        model_name = config["huggingface_model_name"]
+        
+        # Calculate max offload blocks for this model (cached per model)
+        if model_name not in _max_blocks_cache:
+            _max_blocks_cache[model_name] = calculate_max_offload_blocks(
+                dest_gpu_id=config["dest_gpu_id"],
+                model_name=model_name,
+                block_size=BLOCK_SIZE,
+            )
+        config["num_gpu_blocks"] = _max_blocks_cache[model_name]
         
         # Load prompts for this config
         config["prompts"] = load_prompts(config["prompt_set"])
@@ -201,6 +273,7 @@ def init_configs() -> None:
 def run_tests() -> None:
     for config_name, config in configs.items():
         prompts = config["prompts"]
+        num_gpu_blocks = config["num_gpu_blocks"]
         print(f"\n{'='*60}")
         print(f"Running tests for: {config_name} ({len(prompts)} prompts)")
         print(f"{'='*60}")
@@ -215,7 +288,7 @@ def run_tests() -> None:
                     kv_role="kv_both",
                     kv_connector_extra_config={
                         "spec_name": "GPUOffloadingSpec",
-                        "num_gpu_blocks": NUM_BLOCKS,
+                        "num_gpu_blocks": num_gpu_blocks,
                         "dest_gpu_id": DEST_GPU_ID,
                         "block_size": BLOCK_SIZE,
                         "eviction_policy": EVICTION_POLICY,
@@ -237,6 +310,10 @@ def run_tests() -> None:
             config["runtime_gpu"].append(e)
             
         try:
+            # For CPU offloading, use same number of blocks as GPU
+            # (CPU RAM is larger but allocation is slower)
+            num_cpu_blocks = num_gpu_blocks
+            print(f"CPU offloading with {num_cpu_blocks:,} blocks")
             llm_cpu = LLM(
                 model=config["huggingface_model_name"],
                 kv_transfer_config=KVTransferConfig(
@@ -244,7 +321,7 @@ def run_tests() -> None:
                     kv_role="kv_both",
                     kv_connector_extra_config={
                         "spec_name": "CPUOffloadingSpec",
-                        "num_cpu_blocks": NUM_BLOCKS,
+                        "num_cpu_blocks": num_cpu_blocks,
                         "block_size": BLOCK_SIZE,
                         "eviction_policy": EVICTION_POLICY,
                     },
