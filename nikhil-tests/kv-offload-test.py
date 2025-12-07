@@ -15,15 +15,15 @@ huggingface_api_key = os.getenv("hf_token")
 # ============================================================
 # Customizable Test Parameters (CHECK BEFORE RUN!!)
 # ============================================================
-BLOCK_SIZE = 16
-EVICTION_POLICY = "lru"
+BLOCK_SIZE = 16 #vllm default block size
+# List of eviction policies to test; each policy is run separately and reported separately.
+EVICTION_POLICIES = ["lru", "arc"]
 DEST_GPU_ID = 1
 NUM_BLOCKS = 10000  # Default, will be updated per model
 NUM_TRIALS = 1
 MAX_TOKENS = 800  # Global max tokens for all configs
 # Size tiers: name -> max_num_sequences
 SIZE_TIERS = {
-#     "test": 2,
 #     "xsmall": 50,
 #    "small": 100,
 #    "medium": 200,
@@ -32,7 +32,7 @@ SIZE_TIERS = {
 
 # Define models to test: model_name -> param_size_billions
 models = {
-    # "facebook/opt-125m": 0.125,
+    #"facebook/opt-125m": 0.125,
     # "mistralai/Mistral-7B-Instruct-v0.1": 7.0,
     "deepseek-ai/DeepSeek-Coder-V2-Lite-Base": 16.0,
 }
@@ -48,10 +48,8 @@ STAT_KEYS = [
     "blocks_freed",
 ]
 # ============================================================
-# Customizable Test Parameters (CHECK BEFORE RUN!!)
+# 
 # ============================================================
-
-
 def calculate_max_offload_blocks(
     dest_gpu_id: int,
     model_name: str,
@@ -207,25 +205,28 @@ def generate_configs(models: dict[str, float]) -> dict:
             prompt_abbrev = "uniq" if prompt_set == "unique" else "shared"
             
             for size_name, max_seqs in SIZE_TIERS.items():
-                config_name = f"{short_name}_{size_name}_{prompt_abbrev}"
-                configs[config_name] = {
-                    "huggingface_model_name": model_name,
-                    "model_parameters_in_billions": param_size,
-                    "prompt_set": prompt_set,
-                    "prompts": None,
-                    "avg_input_length": None,
-                    "avg_output_length": MAX_TOKENS,
-                    "max_num_sequences": max_seqs,
-                    "num_gpu_blocks": NUM_BLOCKS,
-                    "max_tokens": MAX_TOKENS,
-                    "dest_gpu_id": DEST_GPU_ID,
-                    "gpu_mem_util": None,
-                    "memory_usage": None,
-                    "gpu_offloading_stats": [],
-                    "cpu_offloading_stats": [],
-                    "runtime_gpu": [],
-                    "runtime_cpu": [],
-                }
+                for policy in EVICTION_POLICIES:
+                    config_name = f"{short_name}_{size_name}_{prompt_abbrev}_{policy}"
+                    configs[config_name] = {
+                        "huggingface_model_name": model_name,
+                        "model_parameters_in_billions": param_size,
+                        "prompt_set": prompt_set,
+                        "prompts": None,
+                        "avg_input_length": None,
+                        "avg_output_length": MAX_TOKENS,
+                        "max_num_sequences": max_seqs,
+                        "size_tier": size_name,
+                        "num_gpu_blocks": NUM_BLOCKS,
+                        "max_tokens": MAX_TOKENS,
+                        "dest_gpu_id": DEST_GPU_ID,
+                        "gpu_mem_util": None,
+                        "memory_usage": None,
+                        "gpu_offloading_stats": [],
+                        "cpu_offloading_stats": [],
+                        "runtime_gpu": [],
+                        "runtime_cpu": [],
+                        "eviction_policy": policy,
+                    }
     
     return configs
 
@@ -284,6 +285,7 @@ def run_tests() -> None:
     for config_name, config in configs.items():
         prompts = config["prompts"]
         num_gpu_blocks = config["num_gpu_blocks"]
+        policy = config.get("eviction_policy", "lru")
         print(f"\n{'='*60}")
         print(f"Running tests for: {config_name} ({len(prompts)} prompts)")
         print(f"{'='*60}")
@@ -300,12 +302,11 @@ def run_tests() -> None:
                         "spec_name": "GPUOffloadingSpec",
                         "num_gpu_blocks": num_gpu_blocks,
                         "dest_gpu_id": DEST_GPU_ID,
-                        "eviction_policy": EVICTION_POLICY,
+                        "eviction_policy": policy,
                     },
                 ),
                 gpu_memory_utilization=config["gpu_mem_util"],
             )
-            
             for i in range(NUM_TRIALS):
                 start = time.perf_counter()
                 llm_gpu.generate(prompts, sampling_params=SamplingParams(max_tokens=config["max_tokens"]))
@@ -338,7 +339,7 @@ def run_tests() -> None:
                     kv_connector_extra_config={
                         "spec_name": "CPUOffloadingSpec",
                         "num_cpu_blocks": num_cpu_blocks,
-                        "eviction_policy": EVICTION_POLICY,
+                        "eviction_policy": policy,
                     },
                 ),
                 gpu_memory_utilization=config["gpu_mem_util"],
@@ -362,13 +363,16 @@ def print_results() -> None:
 
     # Prepare rows
     rows = []
+    trial_rows = []
     size_order = {"xsmall": 0, "small": 1, "medium": 2, "large": 3}
     prompt_order = {"unique": 0, "shared_prefix": 1}
+    policy_order = {p: i for i, p in enumerate(EVICTION_POLICIES)}
 
     for config_name, config_data in configs.items():
         model_name = config_data["huggingface_model_name"]
-        size_tier = config_name.split("_")[-2] if "_" in config_name else "unknown"
+        size_tier = config_data.get("size_tier", config_name.split("_")[-2] if "_" in config_name else "unknown")
         prompt_set = config_data["prompt_set"]
+        policy = config_data.get("eviction_policy", "lru")
 
         # Runtimes
         avg_gpu = None
@@ -384,6 +388,15 @@ def print_results() -> None:
             speedup_s = avg_cpu - avg_gpu
             speedup_pct = (speedup_s / avg_cpu) * 100 if avg_cpu > 0 else 0.0
 
+        prompt_count = len(config_data.get("prompts", [])) if config_data.get("prompts") is not None else 0
+        total_tokens = ((config_data.get("avg_input_length") or 0) + config_data.get("max_tokens", 0)) * prompt_count
+        gpu_throughput = None
+        cpu_throughput = None
+        if avg_gpu is not None and avg_gpu > 0 and total_tokens > 0:
+            gpu_throughput = total_tokens / avg_gpu
+        if avg_cpu is not None and avg_cpu > 0 and total_tokens > 0:
+            cpu_throughput = total_tokens / avg_cpu
+
         # Offload stats (GPU run)
         offload_blocks = None
         reload_blocks = None
@@ -392,19 +405,83 @@ def print_results() -> None:
             offload_blocks = stats.get("blocks_offloaded")
             reload_blocks = stats.get("blocks_reloaded")
 
+        # Collect per-trial rows for CSV output (GPU)
+        gpu_stats = config_data["gpu_offloading_stats"][-1] if config_data["gpu_offloading_stats"] else {}
+        for idx, runtime in enumerate(config_data["runtime_gpu"]):
+            gpu_throughput_trial = None
+            if not isinstance(runtime, Exception) and runtime > 0 and total_tokens > 0:
+                gpu_throughput_trial = total_tokens / runtime
+            trial_rows.append({
+                "model": model_name,
+                "config": config_name,
+                "size": size_tier,
+                "prompt_set": prompt_set,
+                "policy": policy,
+                "backend": "gpu",
+                "trial_index": idx + 1,
+                "runtime_s": None if isinstance(runtime, Exception) else runtime,
+                "error": str(runtime) if isinstance(runtime, Exception) else "",
+                "throughput_tok_s": gpu_throughput_trial,
+                "max_seq": config_data["max_num_sequences"],
+                "avg_input_length": config_data["avg_input_length"] or 0,
+                "max_tokens": config_data["max_tokens"],
+                "num_gpu_blocks": config_data["num_gpu_blocks"],
+                "dest_gpu_id": config_data["dest_gpu_id"],
+                "gpu_mem_util": config_data["gpu_mem_util"],
+                "blocks_offloaded": gpu_stats.get("blocks_offloaded"),
+                "blocks_reloaded": gpu_stats.get("blocks_reloaded"),
+                "blocks_allocated": gpu_stats.get("blocks_allocated"),
+                "blocks_evicted": gpu_stats.get("blocks_evicted"),
+                "blocks_freed": gpu_stats.get("blocks_freed"),
+            })
+
+        # Collect per-trial rows for CSV output (CPU)
+        cpu_stats = config_data["cpu_offloading_stats"][-1] if config_data["cpu_offloading_stats"] else {}
+        for idx, runtime in enumerate(config_data["runtime_cpu"]):
+            cpu_throughput_trial = None
+            if not isinstance(runtime, Exception) and runtime > 0 and total_tokens > 0:
+                cpu_throughput_trial = total_tokens / runtime
+            trial_rows.append({
+                "model": model_name,
+                "config": config_name,
+                "size": size_tier,
+                "prompt_set": prompt_set,
+                "policy": policy,
+                "backend": "cpu",
+                "trial_index": idx + 1,
+                "runtime_s": None if isinstance(runtime, Exception) else runtime,
+                "error": str(runtime) if isinstance(runtime, Exception) else "",
+                "throughput_tok_s": cpu_throughput_trial,
+                "max_seq": config_data["max_num_sequences"],
+                "avg_input_length": config_data["avg_input_length"] or 0,
+                "max_tokens": config_data["max_tokens"],
+                "num_gpu_blocks": config_data["num_gpu_blocks"],
+                "dest_gpu_id": config_data["dest_gpu_id"],
+                "gpu_mem_util": config_data["gpu_mem_util"],
+                "blocks_offloaded": cpu_stats.get("blocks_offloaded"),
+                "blocks_reloaded": cpu_stats.get("blocks_reloaded"),
+                "blocks_allocated": cpu_stats.get("blocks_allocated"),
+                "blocks_evicted": cpu_stats.get("blocks_evicted"),
+                "blocks_freed": cpu_stats.get("blocks_freed"),
+            })
+
         rows.append({
             "Model": model_name,
             "Config": config_name,
             "Size": size_tier,
             "Prompts": "uniq" if prompt_set == "unique" else "shared",
+            "Policy": policy,
             "MaxSeq": config_data["max_num_sequences"],
             "AvgIn": config_data["avg_input_length"] or 0,
             "GPU_s": None if avg_gpu is None else round(avg_gpu, 2),
             "CPU_s": None if avg_cpu is None else round(avg_cpu, 2),
+            "GPU_tok_s": None if gpu_throughput is None else round(gpu_throughput, 2),
+            "CPU_tok_s": None if cpu_throughput is None else round(cpu_throughput, 2),
             "Speedup_s": None if speedup_s is None else round(speedup_s, 2),
             "Speedup_pct": None if speedup_pct is None else round(speedup_pct, 1),
             "Offload": offload_blocks if offload_blocks is not None else "N/A",
             "Reload": reload_blocks if reload_blocks is not None else "N/A",
+            "Trials": len(config_data["runtime_gpu"]) if config_data["runtime_gpu"] else len(config_data["runtime_cpu"]),
         })
 
     # Sort rows for stable output
@@ -412,28 +489,37 @@ def print_results() -> None:
         r["Model"],
         size_order.get(r["Size"], 99),
         prompt_order.get("unique" if r["Prompts"] == "uniq" else "shared_prefix", 99),
+        policy_order.get(r["Policy"], 99),
     ))
 
-    # Try pandas first for pretty printing
-    try:
-        import pandas as pd  # type: ignore
+    def _print_table(rows_subset: list[dict], title: str) -> None:
+        if not rows_subset:
+            print(f"\nResults for {title}: (no rows)")
+            return
+        try:
+            import pandas as pd  # type: ignore
 
-        df = pd.DataFrame(rows)
-        pd.set_option("display.max_columns", None)
-        pd.set_option("display.width", 160)
-        print("\nResults (pandas):")
-        print(df.to_string(index=False))
-    except Exception:
-        # Fallback to manual alignment
-        cols = ["Model", "Config", "Size", "Prompts", "MaxSeq", "AvgIn", "GPU_s", "CPU_s", "Speedup_s", "Speedup_pct", "Offload", "Reload"]
-        str_rows = [[str(row.get(c, "")) for c in cols] for row in rows]
-        widths = [max(len(col), max((len(r[i]) for r in str_rows), default=0)) for i, col in enumerate(cols)]
-        header = " ".join(col.ljust(widths[i]) for i, col in enumerate(cols))
-        print("\nResults:")
-        print(header)
-        print("-" * len(header))
-        for r in str_rows:
-            print(" ".join(r[i].ljust(widths[i]) for i in range(len(cols))))
+            df = pd.DataFrame(rows_subset)
+            pd.set_option("display.max_columns", None)
+            pd.set_option("display.width", 200)
+            print(f"\nResults for {title} (pandas):")
+            print(df.to_string(index=False))
+        except Exception:
+            cols = ["Model", "Config", "Size", "Prompts", "Policy", "MaxSeq", "AvgIn", "GPU_s", "CPU_s", "GPU_tok_s", "CPU_tok_s", "Speedup_s", "Speedup_pct", "Offload", "Reload", "Trials"]
+            str_rows = [[str(row.get(c, "")) for c in cols] for row in rows_subset]
+            widths = [max(len(col), max((len(r[i]) for r in str_rows), default=0)) for i, col in enumerate(cols)]
+            header = " ".join(col.ljust(widths[i]) for i, col in enumerate(cols))
+            print(f"\nResults for {title}:")
+            print(header)
+            print("-" * len(header))
+            for r in str_rows:
+                print(" ".join(r[i].ljust(widths[i]) for i in range(len(cols))))
+
+    # Print a separate table per eviction policy
+    policies_present = sorted({r["Policy"] for r in rows}, key=lambda p: policy_order.get(p, 99))
+    for pol in policies_present:
+        subset = [r for r in rows if r["Policy"] == pol]
+        _print_table(subset, f"policy={pol}")
 
     # Summary
     print("\n" + "#" * 80)
@@ -443,8 +529,48 @@ def print_results() -> None:
     print(f"Models: {sorted(set(r['Model'] for r in rows))}")
     print(f"Size tiers: {list(SIZE_TIERS.keys())}")
     print(f"Prompt sets: {PROMPT_SET_NAMES}")
+    print(f"Eviction policies: {EVICTION_POLICIES}")
+    print(f"Trials per config: {NUM_TRIALS}")
     print(f"Max tokens: {MAX_TOKENS}")
     print("#" * 80)
+
+    # Write per-trial results to CSV with timestamped filename
+    results_dir = os.path.join(os.path.dirname(__file__), "results")
+    os.makedirs(results_dir, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    csv_path = os.path.join(results_dir, f"{timestamp}.csv")
+    fieldnames = [
+        "model",
+        "config",
+        "size",
+        "prompt_set",
+        "policy",
+        "backend",
+        "trial_index",
+        "runtime_s",
+        "error",
+        "throughput_tok_s",
+        "max_seq",
+        "avg_input_length",
+        "max_tokens",
+        "num_gpu_blocks",
+        "dest_gpu_id",
+        "gpu_mem_util",
+        "blocks_offloaded",
+        "blocks_reloaded",
+        "blocks_allocated",
+        "blocks_evicted",
+        "blocks_freed",
+    ]
+    try:
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in trial_rows:
+                writer.writerow(row)
+        print(f"Saved per-trial results to {csv_path}")
+    except Exception as e:
+        print(f"Failed to write CSV results: {e}")
 
 if __name__ == "__main__":
     # Generate configs for all models (both prompt sets)
