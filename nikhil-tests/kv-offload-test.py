@@ -12,17 +12,14 @@ from collections import defaultdict
 import os
 os.environ.setdefault("VLLM_SKIP_MEMORY_CHECK", "1")
 huggingface_api_key = os.getenv("hf_token")
-
-
 # ============================================================
 # Customizable Test Parameters (CHECK BEFORE RUN!!)
 # ============================================================
-
 BLOCK_SIZE = 16
-EVICTION_POLICY = "arc"
+EVICTION_POLICY = "lru"
 DEST_GPU_ID = 1
 NUM_BLOCKS = 10000  # Default, will be updated per model
-NUM_TRIALS = 2
+NUM_TRIALS = 1
 MAX_TOKENS = 800  # Global max tokens for all configs
 # Size tiers: name -> max_num_sequences
 SIZE_TIERS = {
@@ -42,7 +39,7 @@ models = {
 
 # Prompt sets to test
 PROMPT_SET_NAMES = ["unique",] #"shared_prefix"
-
+NUM_PROMPTS = 300 #number of prompts to take from the prompt set
 STAT_KEYS = [
     "blocks_offloaded",
     "blocks_reloaded",
@@ -118,7 +115,7 @@ PROMPT_SETS = {
     "default": "prompts.csv",
 }
 
-def load_prompts(prompt_set: str) -> list[str]:
+def load_prompts(prompt_set: str, num_prompts: int = NUM_PROMPTS) -> list[str]:
     """Load prompts from a CSV file based on prompt set name."""
     if prompt_set in PROMPT_SETS:
         filepath = PROMPT_SETS[prompt_set]
@@ -129,7 +126,7 @@ def load_prompts(prompt_set: str) -> list[str]:
     with open(filepath) as f:
         reader = csv.DictReader(f)
         res = [row["prompt"] for row in reader]
-        return res
+        return res[:num_prompts]
 
 def calculate_gpu_mem_util(
     gpu_id: int, 
