@@ -32,11 +32,12 @@ MODELS = {
 MODEL = "mistral"
 MODEL_NAME = MODELS[MODEL]["name"]
 GPU_MEMORY_UTILIZATION = MODELS[MODEL]["gpu_memory_utilization"]
-# Increase offload storage to hold more evicted blocks
-NUM_BLOCKS = 10000
+
+
 DEST_GPU_ID = 1
 BLOCK_SIZE = 16
 EVICTION_POLICY = "lru"  # "arc" has a bug with touch()
+NUM_BLOCKS = 10000
 
 # Fixed prompts reused across runs to trigger prefix cache reloads
 SHARED_PROMPTS = [
@@ -162,7 +163,7 @@ def create_cpu_offloading_llm() -> LLM:
         kv_connector="OffloadingConnector",
         kv_role="kv_both",
         kv_connector_extra_config={
-            "spec_name": "CPUOffloadingSpec",
+            "spec_name": "xfloadingSpec",
             "num_cpu_blocks": NUM_BLOCKS,
             "block_size": BLOCK_SIZE,
             "eviction_policy": EVICTION_POLICY,
@@ -229,6 +230,10 @@ def generate_prompts(num_requests: int, reuse_prefix: bool = True) -> list[str]:
 # ============================================================
 # Stats Collection
 # ============================================================
+def get_free_blocks(gpu_id: int, block_size: int) -> int:
+    free_bytes, total_bytes = torch.cuda.mem_get_info(gpu_id)
+    return free_bytes // block_size
+
 
 def get_offloading_stats(llm_instance: LLM) -> dict[str, int]:
     """Aggregate offloading stats from all workers."""

@@ -10,12 +10,38 @@ from gpu_gpu_kv_offload_test import *
 from memory_calculator import *
 from collections import defaultdict
 import os
+os.environ.setdefault("VLLM_SKIP_MEMORY_CHECK", "1")
 huggingface_api_key = os.getenv("hf_token")
+
+
+# ============================================================
+# Customizable Test Parameters (CHECK BEFORE RUN!!)
+# ============================================================
 
 BLOCK_SIZE = 16
 EVICTION_POLICY = "arc"
 DEST_GPU_ID = 1
-NUM_TRIALS = 1
+NUM_BLOCKS = 10000  # Default, will be updated per model
+NUM_TRIALS = 2
+MAX_TOKENS = 800  # Global max tokens for all configs
+# Size tiers: name -> max_num_sequences
+SIZE_TIERS = {
+#     "test": 2,
+#     "xsmall": 50,
+#    "small": 100,
+#    "medium": 200,
+    "large": 300,
+}
+
+# Define models to test: model_name -> param_size_billions
+models = {
+    # "facebook/opt-125m": 0.125,
+    # "mistralai/Mistral-7B-Instruct-v0.1": 7.0,
+    "deepseek-ai/DeepSeek-Coder-V2-Lite-Base": 16.0,
+}
+
+# Prompt sets to test
+PROMPT_SET_NAMES = ["unique",] #"shared_prefix"
 
 STAT_KEYS = [
     "blocks_offloaded",
@@ -24,6 +50,9 @@ STAT_KEYS = [
     "blocks_evicted",
     "blocks_freed",
 ]
+# ============================================================
+# Customizable Test Parameters (CHECK BEFORE RUN!!)
+# ============================================================
 
 
 def calculate_max_offload_blocks(
@@ -79,10 +108,6 @@ def calculate_max_offload_blocks(
     print(f"======================================\n")
     
     return max_blocks
-
-
-# Will be computed per model
-NUM_BLOCKS = 10000  # Default, will be updated per model
 
 # ============================================================
 # Prompt Sets
@@ -163,19 +188,7 @@ def calculate_gpu_mem_util(
 # ============================================================
 # Config Generation
 # ============================================================
-MAX_TOKENS = 250  # Global max tokens for all configs
 
-# Size tiers: name -> max_num_sequences
-SIZE_TIERS = {
-    #"test": 2,
-    #"xsmall": 50,
-#    "small": 100,
-#    "medium": 200,
-    "large": 300,
-}
-
-# Prompt sets to test
-PROMPT_SET_NAMES = ["unique", "shared_prefix"]
 
 def generate_configs(models: dict[str, float]) -> dict:
     """
@@ -264,8 +277,8 @@ def init_configs() -> None:
             gpu_id=config["dest_gpu_id"], 
             model_weight_gb=mem_usage.model_weight_memory,
             activation_gb=mem_usage.activation_memory,
-            min_kv_cache_gb=2.0,      # Minimal working set for KV cache on GPU
-            cuda_overhead_gb=2.0       # CUDA context + allocator overhead
+            min_kv_cache_gb=1.0,      # Minimal working set for KV cache on GPU
+            cuda_overhead_gb=0.5       # CUDA context + allocator overhead
         )
         print(f"Full KV cache would need: {mem_usage.kv_cache_memory:.2f} GB (will be offloaded)")
         print(f"Memory Usage for Config {config_name}: {config['memory_usage'].total_memory_usage:.2f} GB\n")
@@ -290,7 +303,6 @@ def run_tests() -> None:
                         "spec_name": "GPUOffloadingSpec",
                         "num_gpu_blocks": num_gpu_blocks,
                         "dest_gpu_id": DEST_GPU_ID,
-                        "block_size": BLOCK_SIZE,
                         "eviction_policy": EVICTION_POLICY,
                     },
                 ),
@@ -308,7 +320,14 @@ def run_tests() -> None:
                 shutdown_llm(llm_gpu)
             config["gpu_offloading_stats"].append({})
             config["runtime_gpu"].append(e)
-            
+        else:
+            # Free GPU resources before starting the CPU-offload run
+            if llm_gpu is not None:
+                shutdown_llm(llm_gpu)
+            torch.cuda.empty_cache()
+            gc.collect()
+        # allow allocator to settle before CPU instantiation
+        time.sleep(5)
         try:
             # For CPU offloading, use same number of blocks as GPU
             # (CPU RAM is larger but allocation is slower)
@@ -322,7 +341,6 @@ def run_tests() -> None:
                     kv_connector_extra_config={
                         "spec_name": "CPUOffloadingSpec",
                         "num_cpu_blocks": num_cpu_blocks,
-                        "block_size": BLOCK_SIZE,
                         "eviction_policy": EVICTION_POLICY,
                     },
                 ),
@@ -343,99 +361,95 @@ def run_tests() -> None:
 
         
 def print_results() -> None:
-    """Print results grouped by model in a comparable table format."""
-    
-    # Group configs by model
-    models_configs = {}
+    """Collect results into a table and print with nice alignment (pandas if available)."""
+
+    # Prepare rows
+    rows = []
+    size_order = {"xsmall": 0, "small": 1, "medium": 2, "large": 3}
+    prompt_order = {"unique": 0, "shared_prefix": 1}
+
     for config_name, config_data in configs.items():
         model_name = config_data["huggingface_model_name"]
-        if model_name not in models_configs:
-            models_configs[model_name] = []
-        models_configs[model_name].append((config_name, config_data))
-    
-    # Print results for each model
-    for model_name, model_configs in models_configs.items():
-        param_size = model_configs[0][1]["model_parameters_in_billions"]
-        
-        print("\n" + "=" * 130)
-        print(f"MODEL: {model_name} ({param_size}B params)")
-        print("=" * 130)
-        
-        # Table header
-        header = f"{'Config':<25} {'Prompts':<10} {'MaxSeq':<8} {'AvgIn':<7} {'GPU(s)':<10} {'CPU(s)':<10} {'Speedup':<12} {'Offload':<20} {'Reload':<10}"
+        size_tier = config_name.split("_")[-2] if "_" in config_name else "unknown"
+        prompt_set = config_data["prompt_set"]
+
+        # Runtimes
+        avg_gpu = None
+        avg_cpu = None
+        if config_data["runtime_gpu"] and not any(isinstance(r, Exception) for r in config_data["runtime_gpu"]):
+            avg_gpu = sum(config_data["runtime_gpu"]) / len(config_data["runtime_gpu"])
+        if config_data["runtime_cpu"] and not any(isinstance(r, Exception) for r in config_data["runtime_cpu"]):
+            avg_cpu = sum(config_data["runtime_cpu"]) / len(config_data["runtime_cpu"])
+
+        speedup_s = None
+        speedup_pct = None
+        if avg_gpu is not None and avg_cpu is not None:
+            speedup_s = avg_cpu - avg_gpu
+            speedup_pct = (speedup_s / avg_cpu) * 100 if avg_cpu > 0 else 0.0
+
+        # Offload stats (GPU run)
+        offload_blocks = None
+        reload_blocks = None
+        if config_data["gpu_offloading_stats"] and config_data["gpu_offloading_stats"][-1]:
+            stats = config_data["gpu_offloading_stats"][-1]
+            offload_blocks = stats.get("blocks_offloaded")
+            reload_blocks = stats.get("blocks_reloaded")
+
+        rows.append({
+            "Model": model_name,
+            "Config": config_name,
+            "Size": size_tier,
+            "Prompts": "uniq" if prompt_set == "unique" else "shared",
+            "MaxSeq": config_data["max_num_sequences"],
+            "AvgIn": config_data["avg_input_length"] or 0,
+            "GPU_s": None if avg_gpu is None else round(avg_gpu, 2),
+            "CPU_s": None if avg_cpu is None else round(avg_cpu, 2),
+            "Speedup_s": None if speedup_s is None else round(speedup_s, 2),
+            "Speedup_pct": None if speedup_pct is None else round(speedup_pct, 1),
+            "Offload": offload_blocks if offload_blocks is not None else "N/A",
+            "Reload": reload_blocks if reload_blocks is not None else "N/A",
+        })
+
+    # Sort rows for stable output
+    rows.sort(key=lambda r: (
+        r["Model"],
+        size_order.get(r["Size"], 99),
+        prompt_order.get("unique" if r["Prompts"] == "uniq" else "shared_prefix", 99),
+    ))
+
+    # Try pandas first for pretty printing
+    try:
+        import pandas as pd  # type: ignore
+
+        df = pd.DataFrame(rows)
+        pd.set_option("display.max_columns", None)
+        pd.set_option("display.width", 160)
+        print("\nResults (pandas):")
+        print(df.to_string(index=False))
+    except Exception:
+        # Fallback to manual alignment
+        cols = ["Model", "Config", "Size", "Prompts", "MaxSeq", "AvgIn", "GPU_s", "CPU_s", "Speedup_s", "Speedup_pct", "Offload", "Reload"]
+        str_rows = [[str(row.get(c, "")) for c in cols] for row in rows]
+        widths = [max(len(col), max((len(r[i]) for r in str_rows), default=0)) for i, col in enumerate(cols)]
+        header = " ".join(col.ljust(widths[i]) for i, col in enumerate(cols))
+        print("\nResults:")
         print(header)
-        print("-" * 130)
-        
-        # Sort configs by size tier then prompt set for consistent ordering
-        size_order = {"xsmall": 0, "small": 1, "medium": 2, "large": 3}
-        prompt_order = {"unique": 0, "shared_prefix": 1}
-        
-        sorted_configs = sorted(model_configs, key=lambda x: (
-            size_order.get(x[0].split("_")[-2], 99),
-            prompt_order.get(x[1]["prompt_set"], 99)
-        ))
-        
-        for config_name, config_data in sorted_configs:
-            # Get runtime data
-            if config_data["runtime_gpu"] and not any(isinstance(r, Exception) for r in config_data["runtime_gpu"]):
-                avg_gpu = sum(config_data["runtime_gpu"]) / len(config_data["runtime_gpu"])
-                gpu_str = f"{avg_gpu:.2f}"
-            else:
-                avg_gpu = None
-                gpu_str = "Error"
-            
-            if config_data["runtime_cpu"] and not any(isinstance(r, Exception) for r in config_data["runtime_cpu"]):
-                avg_cpu = sum(config_data["runtime_cpu"]) / len(config_data["runtime_cpu"])
-                cpu_str = f"{avg_cpu:.2f}"
-            else:
-                avg_cpu = None
-                cpu_str = "Error"
-            
-            # Speedup
-            if avg_gpu and avg_cpu:
-                speedup = avg_cpu - avg_gpu
-                speedup_pct = (speedup / avg_cpu) * 100 if avg_cpu > 0 else 0
-                speedup_str = f"{speedup:+.2f}s ({speedup_pct:+.1f}%)"
-            else:
-                speedup_str = "N/A"
-            
-            # Offloading stats (GPU run)
-            if config_data["gpu_offloading_stats"] and config_data["gpu_offloading_stats"][-1]:
-                stats = config_data["gpu_offloading_stats"][-1]
-                offload_str = f"{stats.get('blocks_offloaded', 0)}"
-                reload_str = f"{stats.get('blocks_reloaded', 0)}"
-            else:
-                offload_str = "N/A"
-                reload_str = "N/A"
-            
-            # Prompt info
-            prompt_abbrev = "uniq" if config_data["prompt_set"] == "unique" else "shared"
-            num_prompts = len(config_data["prompts"]) if config_data["prompts"] else 0
-            
-            row = f"{config_name:<25} {prompt_abbrev:<10} {config_data['max_num_sequences']:<8} {config_data['avg_input_length'] or 0:<7} {gpu_str:<10} {cpu_str:<10} {speedup_str:<12} {offload_str:<20} {reload_str:<10}"
-            print(row)
-        
-        print("=" * 130)
-    
-    # Print summary
-    print("\n" + "#" * 130)
+        print("-" * len(header))
+        for r in str_rows:
+            print(" ".join(r[i].ljust(widths[i]) for i in range(len(cols))))
+
+    # Summary
+    print("\n" + "#" * 80)
     print("SUMMARY")
-    print("#" * 130)
-    print(f"Total configs tested: {len(configs)}")
-    print(f"Models: {list(models_configs.keys())}")
+    print("#" * 80)
+    print(f"Total configs tested: {len(rows)}")
+    print(f"Models: {sorted(set(r['Model'] for r in rows))}")
     print(f"Size tiers: {list(SIZE_TIERS.keys())}")
     print(f"Prompt sets: {PROMPT_SET_NAMES}")
     print(f"Max tokens: {MAX_TOKENS}")
-    print("#" * 130)
+    print("#" * 80)
 
 if __name__ == "__main__":
-    # Define models to test: model_name -> param_size_billions
-    models = {
-        #"facebook/opt-125m": 0.125,
-        "mistralai/Mistral-7B-Instruct-v0.1": 7.0,
-        #"deepseek-ai/DeepSeek-R1-Distill-Llama-70B": 71.0,
-    }
-    
     # Generate configs for all models (both prompt sets)
     configs.update(generate_configs(models))
     
