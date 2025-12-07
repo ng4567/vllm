@@ -16,30 +16,30 @@ huggingface_api_key = os.getenv("hf_token")
 # Customizable Test Parameters (CHECK BEFORE RUN!!)
 # ============================================================
 BLOCK_SIZE = 16 #vllm default block size
-# List of eviction policies to test; each policy is run separately and reported separately.
-EVICTION_POLICIES = ["lru", "arc"]
 DEST_GPU_ID = 1
 NUM_BLOCKS = 10000  # Default, will be updated per model
 NUM_TRIALS = 1
-MAX_TOKENS = 800  # Global max tokens for all configs
+NUM_PROMPTS = 300 #number of prompts to take from the prompt set
+MAX_TOKENS = 2048  # Global max tokens for all configs
+PROMPT_SET_NAMES = ["unique",] #"shared_prefix" # Prompt sets to test
+EVICTION_POLICIES = ["lru",] #"arc" List of eviction policies to test; each policy is run separately and reported separately.
+TEST_GPU = True  # Whether to run GPU offloading tests
+TEST_CPU = False  # Whether to run CPU offloading tests
+
 # Size tiers: name -> max_num_sequences
 SIZE_TIERS = {
-#     "xsmall": 50,
-#    "small": 100,
-#    "medium": 200,
+    "xsmall": 50,
+    # "small": 100,
+    # "medium": 200,
     "large": 300,
 }
-
 # Define models to test: model_name -> param_size_billions
 models = {
-    #"facebook/opt-125m": 0.125,
-    # "mistralai/Mistral-7B-Instruct-v0.1": 7.0,
-    "deepseek-ai/DeepSeek-Coder-V2-Lite-Base": 16.0,
+    "facebook/opt-125m": 0.125,
+    #"mistralai/Mistral-7B-Instruct-v0.1": 7.0,
+    #"deepseek-ai/DeepSeek-Coder-V2-Lite-Base": 16.0,
 }
 
-# Prompt sets to test
-PROMPT_SET_NAMES = ["unique",] #"shared_prefix"
-NUM_PROMPTS = 300 #number of prompts to take from the prompt set
 STAT_KEYS = [
     "blocks_offloaded",
     "blocks_reloaded",
@@ -131,54 +131,62 @@ def calculate_gpu_mem_util(
     model_weight_gb: float, 
     activation_gb: float = 0.0,
     min_kv_cache_gb: float = 0.1,
-    cuda_overhead_gb: float = 0.25
+    cuda_overhead_gb: float = 0.25,
+    model_name: str = "",
 ) -> float:
-    """
-    Calculate GPU memory utilization to force KV offloading.
     
-    We allocate just enough for:
-    - Model weights (required)
-    - Minimal KV cache working set (required for operation)
-    - Activation memory for forward pass (required)
-    - CUDA/PyTorch overhead (required)
+    assert model_name in models.keys(), f"Model {model_name} not in models dict"
+
+    if model_name == "mistralai/Mistral-7B-Instruct-v0.1":
+        return 0.025
+    elif model_name == "facebook/opt-125m":
+        return 0.02  # 1%
     
-    This forces most KV cache to be offloaded to secondary storage.
+    raise ValueError(f"GPU memory utilization not set for model {model_name}")
     
-    Args:
-        gpu_id: GPU device ID
-        model_weight_gb: Model weights size in GB
-        activation_gb: Activation memory needed during forward pass
-        min_kv_cache_gb: Minimum KV cache on GPU (working set)
-        cuda_overhead_gb: CUDA context and PyTorch allocator overhead
+    # """
+    # Calculate GPU memory utilization to force KV offloading.
     
-    Returns:
-        Memory utilization fraction (0.0 to 0.95)
-    """
-    torch.cuda.synchronize(gpu_id)
-    free_bytes, total_bytes = torch.cuda.mem_get_info(gpu_id)
-    total_gb = total_bytes / (1024**3)
+    # We allocate just enough for:
+    # - Model weights (required)
+    # - Minimal KV cache working set (required for operation)
+    # - Activation memory for forward pass (required)
+    # - CUDA/PyTorch overhead (required)
     
-    # Minimum memory needed to run at all
-    required_gb = (
-        model_weight_gb +      # Model weights (non-negotiable)
-        activation_gb +        # Forward pass activations  
-        min_kv_cache_gb +      # Minimal KV cache working set
-        cuda_overhead_gb       # CUDA context, allocator fragmentation
-    )
+    # This forces most KV cache to be offloaded to secondary storage.
     
-    utilization = required_gb / total_gb
+    # Args:
+    #     gpu_id: GPU device ID
+    #     model_weight_gb: Model weights size in GB
+    #     activation_gb: Activation memory needed during forward pass
+    #     min_kv_cache_gb: Minimum KV cache on GPU (working set)
+    #     cuda_overhead_gb: CUDA context and PyTorch allocator overhead
     
-    # Clamp between 0.1 and 0.95
-    utilization = max(0.1, min(0.95, utilization))
+    # Returns:
+    #     Memory utilization fraction (0.0 to 0.95)
+    # """
+    # torch.cuda.synchronize(gpu_id)
+    # free_bytes, total_bytes = torch.cuda.mem_get_info(gpu_id)
+    # total_gb = total_bytes / (1024**3)
     
-    print(f"GPU {gpu_id}: {total_gb:.1f} GB total")
-    print(f"  Model weights: {model_weight_gb:.2f} GB")
-    print(f"  Activations:   {activation_gb:.2f} GB")
-    print(f"  Min KV cache:  {min_kv_cache_gb:.2f} GB")
-    print(f"  CUDA overhead: {cuda_overhead_gb:.2f} GB")
-    print(f"  Total needed:  {required_gb:.2f} GB → utilization: {utilization:.2%}")
+    # # Minimum memory needed to run at all
+    # required_gb = (
+    #     model_weight_gb +      # Model weights (non-negotiable)
+    #     activation_gb +        # Forward pass activations  
+    #     min_kv_cache_gb +      # Minimal KV cache working set
+    #     cuda_overhead_gb       # CUDA context, allocator fragmentation
+    # )
     
-    return utilization
+    # utilization = required_gb / total_gb
+    
+    # print(f"GPU {gpu_id}: {total_gb:.1f} GB total")
+    # print(f"  Model weights: {model_weight_gb:.2f} GB")
+    # print(f"  Activations:   {activation_gb:.2f} GB")
+    # print(f"  Min KV cache:  {min_kv_cache_gb:.2f} GB")
+    # print(f"  CUDA overhead: {cuda_overhead_gb:.2f} GB")
+    # print(f"  Total needed:  {required_gb:.2f} GB → utilization: {utilization:.2%}")
+    
+    # return utilization
 
 # ============================================================
 # Config Generation
@@ -275,8 +283,9 @@ def init_configs() -> None:
             gpu_id=config["dest_gpu_id"], 
             model_weight_gb=mem_usage.model_weight_memory,
             activation_gb=mem_usage.activation_memory,
-            min_kv_cache_gb=1.0,      # Minimal working set for KV cache on GPU
-            cuda_overhead_gb=0.5       # CUDA context + allocator overhead
+            min_kv_cache_gb=0.25,      # Minimal working set for KV cache on GPU
+            cuda_overhead_gb=0.25,       # CUDA context + allocator overhead
+            model_name=config["huggingface_model_name"],
         )
         print(f"Full KV cache would need: {mem_usage.kv_cache_memory:.2f} GB (will be offloaded)")
         print(f"Memory Usage for Config {config_name}: {config['memory_usage'].total_memory_usage:.2f} GB\n")
@@ -292,70 +301,67 @@ def run_tests() -> None:
         
         llm_gpu = None
         llm_cpu = None
-        try:
-            llm_gpu = LLM(
-                model=config["huggingface_model_name"],
-                kv_transfer_config=KVTransferConfig(
-                    kv_connector="OffloadingConnector",
-                    kv_role="kv_both",
-                    kv_connector_extra_config={
-                        "spec_name": "GPUOffloadingSpec",
-                        "num_gpu_blocks": num_gpu_blocks,
-                        "dest_gpu_id": DEST_GPU_ID,
-                        "eviction_policy": policy,
-                    },
-                ),
-                gpu_memory_utilization=config["gpu_mem_util"],
-            )
-            for i in range(NUM_TRIALS):
-                start = time.perf_counter()
-                llm_gpu.generate(prompts, sampling_params=SamplingParams(max_tokens=config["max_tokens"]))
-                config["runtime_gpu"].append(time.perf_counter() - start)
-            config["gpu_offloading_stats"].append(get_offloading_stats(llm_gpu))                
-        except Exception as e:
-            print(f"Error running test for config {config_name}: {e}")
-            if llm_gpu is not None:
-                shutdown_llm(llm_gpu)
-            config["gpu_offloading_stats"].append({})
-            config["runtime_gpu"].append(e)
-        else:
-            # Free GPU resources before starting the CPU-offload run
-            if llm_gpu is not None:
-                shutdown_llm(llm_gpu)
-            torch.cuda.empty_cache()
-            gc.collect()
-        # allow allocator to settle before CPU instantiation
-        time.sleep(5)
-        try:
-            # For CPU offloading, use same number of blocks as GPU
-            # (CPU RAM is larger but allocation is slower)
-            num_cpu_blocks = num_gpu_blocks
-            print(f"CPU offloading with {num_cpu_blocks:,} blocks")
-            llm_cpu = LLM(
-                model=config["huggingface_model_name"],
-                kv_transfer_config=KVTransferConfig(
-                    kv_connector="OffloadingConnector",
-                    kv_role="kv_both",
-                    kv_connector_extra_config={
-                        "spec_name": "CPUOffloadingSpec",
-                        "num_cpu_blocks": num_cpu_blocks,
-                        "eviction_policy": policy,
-                    },
-                ),
-                gpu_memory_utilization=config["gpu_mem_util"],
-            )
+        if TEST_GPU:
+            try:
+                print(f"GPU offloading with {num_gpu_blocks:,} blocks")
+                llm_gpu = LLM(
+                    model=config["huggingface_model_name"],
+                    kv_transfer_config=KVTransferConfig(
+                        kv_connector="OffloadingConnector",
+                        kv_role="kv_both",
+                        kv_connector_extra_config={
+                            "spec_name": "GPUOffloadingSpec",
+                            "num_gpu_blocks": num_gpu_blocks,
+                            "dest_gpu_id": config["dest_gpu_id"],
+                            "eviction_policy": policy,
+                            "kv_cache_memory_bytes": 10,
+                        },
+                    ),
+                    gpu_memory_utilization=config["gpu_mem_util"],
+                )
 
-            for i in range(NUM_TRIALS):
-                start = time.perf_counter()
-                llm_cpu.generate(prompts, sampling_params=SamplingParams(max_tokens=config["max_tokens"]))
-                config["runtime_cpu"].append(time.perf_counter() - start)
-            config["cpu_offloading_stats"].append(get_offloading_stats(llm_cpu))
-        except Exception as e:
+                for i in range(NUM_TRIALS):
+                    start = time.perf_counter()
+                    llm_gpu.generate(prompts, sampling_params=SamplingParams(max_tokens=config["max_tokens"]))
+                    config["runtime_gpu"].append(time.perf_counter() - start)
+                config["gpu_offloading_stats"].append(get_offloading_stats(llm_gpu))
+            except Exception as e:
                 print(f"Error running test for config {config_name}: {e}")
-                if llm_cpu is not None:
-                    shutdown_llm(llm_cpu)
-                config["cpu_offloading_stats"].append({})
-                config["runtime_cpu"].append(e)
+                if llm_gpu is not None:
+                    shutdown_llm(llm_gpu)
+                config["gpu_offloading_stats"].append({})
+                config["runtime_gpu"].append(e)
+        if TEST_CPU:
+            try:
+                # For CPU offloading, use same number of blocks as GPU
+                # (CPU RAM is larger but allocation is slower)
+                num_cpu_blocks = num_gpu_blocks
+                print(f"CPU offloading with {num_cpu_blocks:,} blocks")
+                llm_cpu = LLM(
+                    model=config["huggingface_model_name"],
+                    kv_transfer_config=KVTransferConfig(
+                        kv_connector="OffloadingConnector",
+                        kv_role="kv_both",
+                        kv_connector_extra_config={
+                            "spec_name": "CPUOffloadingSpec",
+                            "num_cpu_blocks": num_cpu_blocks,
+                            "eviction_policy": policy,
+                        },
+                    ),
+                    gpu_memory_utilization=config["gpu_mem_util"],
+                )
+
+                for i in range(NUM_TRIALS):
+                    start = time.perf_counter()
+                    llm_cpu.generate(prompts, sampling_params=SamplingParams(max_tokens=config["max_tokens"]))
+                    config["runtime_cpu"].append(time.perf_counter() - start)
+                config["cpu_offloading_stats"].append(get_offloading_stats(llm_cpu))
+            except Exception as e:
+                    print(f"Error running test for config {config_name}: {e}")
+                    if llm_cpu is not None:
+                        shutdown_llm(llm_cpu)
+                    config["cpu_offloading_stats"].append({})
+                    config["runtime_cpu"].append(e)
 
         
 def print_results() -> None:
