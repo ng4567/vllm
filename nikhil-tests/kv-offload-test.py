@@ -20,23 +20,24 @@ DEST_GPU_ID = 1
 NUM_BLOCKS = 10000  # Default, will be updated per model
 NUM_TRIALS = 1
 NUM_PROMPTS = 300 #number of prompts to take from the prompt set
-MAX_TOKENS = 2048  # Global max tokens for all configs
-PROMPT_SET_NAMES = ["unique",] #"shared_prefix" # Prompt sets to test
-EVICTION_POLICIES = ["lru",] #"arc" List of eviction policies to test; each policy is run separately and reported separately.
+MAX_TOKENS = 6000  # Global max tokens for all configs
+PROMPT_SET_NAMES = ["shared_prefix", "unique"] # ["unique", "shared_prefix"] # Prompt sets to test
+EVICTION_POLICIES = ["lru", "arc"] #"arc" List of eviction policies to test; each policy is run separately and reported separately.
 TEST_GPU = True  # Whether to run GPU offloading tests
-TEST_CPU = False  # Whether to run CPU offloading tests
+TEST_CPU = True  # Whether to run CPU offloading tests
 
 # Size tiers: name -> max_num_sequences
 SIZE_TIERS = {
     "xsmall": 50,
-    # "small": 100,
-    # "medium": 200,
+    "small": 100,
+    "medium": 200,
     "large": 300,
+    "xlarge": 500,
 }
 # Define models to test: model_name -> param_size_billions
 models = {
     "facebook/opt-125m": 0.125,
-    #"mistralai/Mistral-7B-Instruct-v0.1": 7.0,
+    "mistralai/Mistral-7B-Instruct-v0.1": 7.0,
     #"deepseek-ai/DeepSeek-Coder-V2-Lite-Base": 16.0,
 }
 
@@ -70,6 +71,7 @@ def calculate_max_offload_blocks(
     Returns:
         Maximum number of blocks that can fit on the destination GPU
     """
+    global _block_bytes_cache
     # Get model config to determine KV cache dimensions
     config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
     
@@ -80,6 +82,7 @@ def calculate_max_offload_blocks(
     # Calculate bytes per KV cache block
     # Each block stores: 2 (K+V) × num_kv_heads × head_dim × num_layers × dtype_bytes × block_size
     bytes_per_block = 2 * num_kv_heads * head_dim * num_layers * dtype_bytes * block_size
+    _block_bytes_cache[model_name] = bytes_per_block
     
     # Get available memory on destination GPU
     torch.cuda.synchronize(dest_gpu_id)
@@ -143,7 +146,7 @@ def calculate_gpu_mem_util(
     if model_name == "mistralai/Mistral-7B-Instruct-v0.1":
         return 0.3
     elif model_name == "facebook/opt-125m":
-        return 0.025  # 1%
+        return 0.025  # 4%
     
     raise ValueError(f"GPU memory utilization not set for model {model_name}")
     
@@ -246,6 +249,7 @@ configs = {}
 
 # Cache for max blocks per model (calculated once per model)
 _max_blocks_cache: dict[str, int] = {}
+_block_bytes_cache: dict[str, int] = {}
 
 def init_configs() -> None:
     for config_name, config in configs.items():
@@ -317,11 +321,24 @@ def run_tests() -> None:
                             "num_gpu_blocks": num_gpu_blocks,
                             "dest_gpu_id": config["dest_gpu_id"],
                             "eviction_policy": policy,
-                            "kv_cache_memory_bytes": 10,
                         },
                     ),
                     gpu_memory_utilization=config["gpu_mem_util"],
                 )
+                    # Capture memory snapshot for compute and dest GPUs
+                compute_device = torch.cuda.current_device()
+                comp_free, comp_total = torch.cuda.mem_get_info(compute_device)
+                dest_free, dest_total = torch.cuda.mem_get_info(config["dest_gpu_id"])
+                config["mem_snapshot"] = {
+                    "compute_device": compute_device,
+                    "compute_free_gb": comp_free / 1e9,
+                    "compute_total_gb": comp_total / 1e9,
+                    "compute_used_gb": (comp_total - comp_free) / 1e9,
+                    "dest_device": config["dest_gpu_id"],
+                    "dest_free_gb": dest_free / 1e9,
+                    "dest_total_gb": dest_total / 1e9,
+                    "dest_used_gb": (dest_total - dest_free) / 1e9,
+                }
 
                 for i in range(NUM_TRIALS):
                     start = time.perf_counter()
@@ -382,6 +399,7 @@ def print_results() -> None:
         size_tier = config_data.get("size_tier", config_name.split("_")[-2] if "_" in config_name else "unknown")
         prompt_set = config_data["prompt_set"]
         policy = config_data.get("eviction_policy", "lru")
+        mem_snapshot = config_data.get("mem_snapshot", {})
 
         # Runtimes
         avg_gpu = None
@@ -414,6 +432,11 @@ def print_results() -> None:
             offload_blocks = stats.get("blocks_offloaded")
             reload_blocks = stats.get("blocks_reloaded")
 
+        block_bytes = _block_bytes_cache.get(model_name)
+        offload_kv_capacity_gb = None
+        if block_bytes is not None:
+            offload_kv_capacity_gb = (config_data["num_gpu_blocks"] * block_bytes) / 1e9
+
         # Collect per-trial rows for CSV output (GPU)
         gpu_stats = config_data["gpu_offloading_stats"][-1] if config_data["gpu_offloading_stats"] else {}
         for idx, runtime in enumerate(config_data["runtime_gpu"]):
@@ -431,6 +454,12 @@ def print_results() -> None:
                 "runtime_s": None if isinstance(runtime, Exception) else runtime,
                 "error": str(runtime) if isinstance(runtime, Exception) else "",
                 "throughput_tok_s": gpu_throughput_trial,
+                "compute_used_gb": mem_snapshot.get("compute_used_gb"),
+                "compute_total_gb": mem_snapshot.get("compute_total_gb"),
+                "dest_used_gb": mem_snapshot.get("dest_used_gb"),
+                "dest_total_gb": mem_snapshot.get("dest_total_gb"),
+                "gpu_mem_util": config_data.get("gpu_mem_util"),
+                "offload_kv_capacity_gb": offload_kv_capacity_gb,
                 "max_seq": config_data["max_num_sequences"],
                 "avg_input_length": config_data["avg_input_length"] or 0,
                 "max_tokens": config_data["max_tokens"],
@@ -461,6 +490,12 @@ def print_results() -> None:
                 "runtime_s": None if isinstance(runtime, Exception) else runtime,
                 "error": str(runtime) if isinstance(runtime, Exception) else "",
                 "throughput_tok_s": cpu_throughput_trial,
+                "compute_used_gb": mem_snapshot.get("compute_used_gb"),
+                "compute_total_gb": mem_snapshot.get("compute_total_gb"),
+                "dest_used_gb": mem_snapshot.get("dest_used_gb"),
+                "dest_total_gb": mem_snapshot.get("dest_total_gb"),
+                "gpu_mem_util": config_data.get("gpu_mem_util"),
+                "offload_kv_capacity_gb": offload_kv_capacity_gb,
                 "max_seq": config_data["max_num_sequences"],
                 "avg_input_length": config_data["avg_input_length"] or 0,
                 "max_tokens": config_data["max_tokens"],
@@ -486,6 +521,10 @@ def print_results() -> None:
             "CPU_s": None if avg_cpu is None else round(avg_cpu, 2),
             "GPU_tok_s": None if gpu_throughput is None else round(gpu_throughput, 2),
             "CPU_tok_s": None if cpu_throughput is None else round(cpu_throughput, 2),
+            "Compute_used_GB": mem_snapshot.get("compute_used_gb"),
+            "Dest_used_GB": mem_snapshot.get("dest_used_gb"),
+            "Offload_kv_capacity_GB": None if offload_kv_capacity_gb is None else round(offload_kv_capacity_gb, 3),
+            "GPU_mem_util": config_data.get("gpu_mem_util"),
             "Speedup_s": None if speedup_s is None else round(speedup_s, 2),
             "Speedup_pct": None if speedup_pct is None else round(speedup_pct, 1),
             "Offload": offload_blocks if offload_blocks is not None else "N/A",
@@ -514,7 +553,7 @@ def print_results() -> None:
             print(f"\nResults for {title} (pandas):")
             print(df.to_string(index=False))
         except Exception:
-            cols = ["Model", "Config", "Size", "Prompts", "Policy", "MaxSeq", "AvgIn", "GPU_s", "CPU_s", "GPU_tok_s", "CPU_tok_s", "Speedup_s", "Speedup_pct", "Offload", "Reload", "Trials"]
+            cols = ["Model", "Config", "Size", "Prompts", "Policy", "MaxSeq", "AvgIn", "GPU_s", "CPU_s", "GPU_tok_s", "CPU_tok_s", "Compute_used_GB", "Dest_used_GB", "Offload_kv_capacity_GB", "GPU_mem_util", "Speedup_s", "Speedup_pct", "Offload", "Reload", "Trials"]
             str_rows = [[str(row.get(c, "")) for c in cols] for row in rows_subset]
             widths = [max(len(col), max((len(r[i]) for r in str_rows), default=0)) for i, col in enumerate(cols)]
             header = " ".join(col.ljust(widths[i]) for i, col in enumerate(cols))
@@ -559,6 +598,12 @@ def print_results() -> None:
         "runtime_s",
         "error",
         "throughput_tok_s",
+        "compute_used_gb",
+        "compute_total_gb",
+        "dest_used_gb",
+        "dest_total_gb",
+        "gpu_mem_util",
+        "offload_kv_capacity_gb",
         "max_seq",
         "avg_input_length",
         "max_tokens",
