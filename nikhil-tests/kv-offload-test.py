@@ -107,10 +107,11 @@ def calculate_max_offload_blocks(
 # ============================================================
 # Prompt Sets
 # ============================================================
+PROMPT_DIR = os.path.join(os.path.dirname(__file__), "prompts")
 PROMPT_SETS = {
-    "unique": "prompts_unique.csv",
-    "shared_prefix": "prompts_shared_prefix.csv",
-    "default": "prompts.csv",
+    "unique": os.path.join(PROMPT_DIR, "prompts_unique.csv"),
+    "shared_prefix": os.path.join(PROMPT_DIR, "prompts_shared_prefix.csv"),
+    "default": os.path.join(PROMPT_DIR, "prompts.csv"),
 }
 
 def load_prompts(prompt_set: str, num_prompts: int = NUM_PROMPTS) -> list[str]:
@@ -118,8 +119,10 @@ def load_prompts(prompt_set: str, num_prompts: int = NUM_PROMPTS) -> list[str]:
     if prompt_set in PROMPT_SETS:
         filepath = PROMPT_SETS[prompt_set]
     else:
-        # Assume it's a direct file path
+        # Assume it's a direct file path; if relative, resolve against PROMPT_DIR
         filepath = prompt_set
+        if not os.path.isabs(filepath):
+            filepath = os.path.join(PROMPT_DIR, filepath)
     
     with open(filepath) as f:
         reader = csv.DictReader(f)
@@ -138,9 +141,9 @@ def calculate_gpu_mem_util(
     assert model_name in models.keys(), f"Model {model_name} not in models dict"
 
     if model_name == "mistralai/Mistral-7B-Instruct-v0.1":
-        return 0.025
+        return 0.3
     elif model_name == "facebook/opt-125m":
-        return 0.02  # 1%
+        return 0.025  # 1%
     
     raise ValueError(f"GPU memory utilization not set for model {model_name}")
     
