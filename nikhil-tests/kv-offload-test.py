@@ -18,8 +18,8 @@ huggingface_api_key = os.getenv("hf_token")
 BLOCK_SIZE = 16 #vllm default block size
 DEST_GPU_ID = 1
 NUM_BLOCKS = 10000  # Default, will be updated per model
-NUM_TRIALS = 1
-NUM_PROMPTS = 300 #number of prompts to take from the prompt set
+NUM_TRIALS = 5
+NUM_PROMPTS = 8700 #number of prompts to take from the prompt set
 MAX_TOKENS = 6000  # Global max tokens for all configs
 PROMPT_SET_NAMES = ["shared_prefix", "unique"] # ["unique", "shared_prefix"] # Prompt sets to test
 EVICTION_POLICIES = ["lru", "arc"] #"arc" List of eviction policies to test; each policy is run separately and reported separately.
@@ -48,6 +48,38 @@ STAT_KEYS = [
     "blocks_evicted",
     "blocks_freed",
 ]
+# CSV output configuration
+RESULTS_DIR = os.path.join(os.path.dirname(__file__), "results")
+CSV_FIELDNAMES = [
+    "model",
+    "config",
+    "size",
+    "prompt_set",
+    "policy",
+    "backend",
+    "trial_index",
+    "runtime_s",
+    "error",
+    "throughput_tok_s",
+    "compute_used_gb",
+    "compute_total_gb",
+    "dest_used_gb",
+    "dest_total_gb",
+    "gpu_mem_util",
+    "offload_kv_capacity_gb",
+    "max_seq",
+    "avg_input_length",
+    "max_tokens",
+    "num_gpu_blocks",
+    "dest_gpu_id",
+    "gpu_mem_util",
+    "blocks_offloaded",
+    "blocks_reloaded",
+    "blocks_allocated",
+    "blocks_evicted",
+    "blocks_freed",
+]
+CSV_PATH: str | None = None
 # ============================================================
 # 
 # ============================================================
@@ -250,6 +282,77 @@ configs = {}
 # Cache for max blocks per model (calculated once per model)
 _max_blocks_cache: dict[str, int] = {}
 _block_bytes_cache: dict[str, int] = {}
+def init_csv_writer() -> None:
+    """Initialize CSV file with header for incremental writes."""
+    global CSV_PATH
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    CSV_PATH = os.path.join(RESULTS_DIR, f"{timestamp}.csv")
+    with open(CSV_PATH, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
+        writer.writeheader()
+
+
+def append_trial_row(row: dict) -> None:
+    """Append a single trial row to the CSV file."""
+    if CSV_PATH is None:
+        raise RuntimeError("CSV writer not initialized")
+    with open(CSV_PATH, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
+        writer.writerow(row)
+
+
+def build_trial_row(
+    config_name: str,
+    config_data: dict,
+    backend: str,
+    trial_index: int,
+    runtime: float | Exception,
+    stats: dict,
+    total_tokens: int,
+    offload_kv_capacity_gb: float | None,
+) -> dict:
+    """Construct a per-trial CSV row."""
+    model_name = config_data["huggingface_model_name"]
+    size_tier = config_data.get("size_tier", config_name.split("_")[-2] if "_" in config_name else "unknown")
+    prompt_set = config_data["prompt_set"]
+    policy = config_data.get("eviction_policy", "lru")
+    mem_snapshot = config_data.get("mem_snapshot", {})
+
+    throughput = None
+    runtime_val = None if isinstance(runtime, Exception) else runtime
+    if runtime_val and runtime_val > 0 and total_tokens > 0:
+        throughput = total_tokens / runtime_val
+
+    row = {
+        "model": model_name,
+        "config": config_name,
+        "size": size_tier,
+        "prompt_set": prompt_set,
+        "policy": policy,
+        "backend": backend,
+        "trial_index": trial_index,
+        "runtime_s": runtime_val,
+        "error": str(runtime) if isinstance(runtime, Exception) else "",
+        "throughput_tok_s": throughput,
+        "compute_used_gb": mem_snapshot.get("compute_used_gb"),
+        "compute_total_gb": mem_snapshot.get("compute_total_gb"),
+        "dest_used_gb": mem_snapshot.get("dest_used_gb"),
+        "dest_total_gb": mem_snapshot.get("dest_total_gb"),
+        "gpu_mem_util": config_data.get("gpu_mem_util"),
+        "offload_kv_capacity_gb": offload_kv_capacity_gb,
+        "max_seq": config_data["max_num_sequences"],
+        "avg_input_length": config_data["avg_input_length"] or 0,
+        "max_tokens": config_data["max_tokens"],
+        "num_gpu_blocks": config_data["num_gpu_blocks"],
+        "dest_gpu_id": config_data["dest_gpu_id"],
+        "blocks_offloaded": stats.get("blocks_offloaded"),
+        "blocks_reloaded": stats.get("blocks_reloaded"),
+        "blocks_allocated": stats.get("blocks_allocated"),
+        "blocks_evicted": stats.get("blocks_evicted"),
+        "blocks_freed": stats.get("blocks_freed"),
+    }
+    return row
 
 def init_configs() -> None:
     for config_name, config in configs.items():
@@ -302,6 +405,12 @@ def run_tests() -> None:
         prompts = config["prompts"]
         num_gpu_blocks = config["num_gpu_blocks"]
         policy = config.get("eviction_policy", "lru")
+        prompt_count = len(prompts)
+        total_tokens = ((config.get("avg_input_length") or 0) + config.get("max_tokens", 0)) * prompt_count
+        block_bytes = _block_bytes_cache.get(config["huggingface_model_name"])
+        offload_kv_capacity_gb = None
+        if block_bytes is not None:
+            offload_kv_capacity_gb = (config["num_gpu_blocks"] * block_bytes) / 1e9
         print(f"\n{'='*60}")
         print(f"Running tests for: {config_name} ({len(prompts)} prompts)")
         print(f"{'='*60}")
@@ -344,6 +453,18 @@ def run_tests() -> None:
                     start = time.perf_counter()
                     llm_gpu.generate(prompts, sampling_params=SamplingParams(max_tokens=config["max_tokens"]))
                     config["runtime_gpu"].append(time.perf_counter() - start)
+                    append_trial_row(
+                        build_trial_row(
+                            config_name=config_name,
+                            config_data=config,
+                            backend="gpu",
+                            trial_index=i + 1,
+                            runtime=config["runtime_gpu"][-1],
+                            stats={},
+                            total_tokens=total_tokens,
+                            offload_kv_capacity_gb=offload_kv_capacity_gb,
+                        )
+                    )
                 config["gpu_offloading_stats"].append(get_offloading_stats(llm_gpu))
             except Exception as e:
                 print(f"Error running test for config {config_name}: {e}")
@@ -375,6 +496,18 @@ def run_tests() -> None:
                     start = time.perf_counter()
                     llm_cpu.generate(prompts, sampling_params=SamplingParams(max_tokens=config["max_tokens"]))
                     config["runtime_cpu"].append(time.perf_counter() - start)
+                    append_trial_row(
+                        build_trial_row(
+                            config_name=config_name,
+                            config_data=config,
+                            backend="cpu",
+                            trial_index=i + 1,
+                            runtime=config["runtime_cpu"][-1],
+                            stats={},
+                            total_tokens=total_tokens,
+                            offload_kv_capacity_gb=offload_kv_capacity_gb,
+                        )
+                    )
                 config["cpu_offloading_stats"].append(get_offloading_stats(llm_cpu))
             except Exception as e:
                     print(f"Error running test for config {config_name}: {e}")
@@ -582,49 +715,20 @@ def print_results() -> None:
     print(f"Max tokens: {MAX_TOKENS}")
     print("#" * 80)
 
-    # Write per-trial results to CSV with timestamped filename
-    results_dir = os.path.join(os.path.dirname(__file__), "results")
-    os.makedirs(results_dir, exist_ok=True)
-    timestamp = time.strftime("%Y%m%d-%H%M%S")
-    csv_path = os.path.join(results_dir, f"{timestamp}.csv")
-    fieldnames = [
-        "model",
-        "config",
-        "size",
-        "prompt_set",
-        "policy",
-        "backend",
-        "trial_index",
-        "runtime_s",
-        "error",
-        "throughput_tok_s",
-        "compute_used_gb",
-        "compute_total_gb",
-        "dest_used_gb",
-        "dest_total_gb",
-        "gpu_mem_util",
-        "offload_kv_capacity_gb",
-        "max_seq",
-        "avg_input_length",
-        "max_tokens",
-        "num_gpu_blocks",
-        "dest_gpu_id",
-        "gpu_mem_util",
-        "blocks_offloaded",
-        "blocks_reloaded",
-        "blocks_allocated",
-        "blocks_evicted",
-        "blocks_freed",
-    ]
-    try:
-        with open(csv_path, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            for row in trial_rows:
-                writer.writerow(row)
-        print(f"Saved per-trial results to {csv_path}")
-    except Exception as e:
-        print(f"Failed to write CSV results: {e}")
+    if CSV_PATH is not None:
+        print(f"Per-trial rows streamed to {CSV_PATH}")
+    else:
+        # Fallback: write once at the end if streaming was not initialized
+        try:
+            init_csv_writer()
+            assert CSV_PATH is not None
+            with open(CSV_PATH, "a", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
+                for row in trial_rows:
+                    writer.writerow(row)
+            print(f"Per-trial rows written to {CSV_PATH}")
+        except Exception as e:
+            print(f"Failed to write CSV results: {e}")
 
 if __name__ == "__main__":
     # Generate configs for all models (both prompt sets)
@@ -635,6 +739,7 @@ if __name__ == "__main__":
         print(f"  - {name}")
     print()
     
+    init_csv_writer()
     init_configs()
     run_tests()
     print_results()
