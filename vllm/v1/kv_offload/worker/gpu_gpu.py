@@ -19,6 +19,12 @@ _global_handler_instance = None
 
 logger = init_logger(__name__)
 
+# Maximum number of pending async transfers before forcing synchronization
+# This prevents CUDA operation queue overflow that can cause hangs
+# Tuned based on empirical testing: system hung at ~40 requests with ~75 ops each
+# Setting to 20 provides safety margin while maintaining good parallelism
+MAX_PENDING_TRANSFERS = 2000
+
 
 def expand_block_ids(
     block_ids: np.ndarray,
@@ -74,6 +80,7 @@ class GpuGpuOffloadingHandler(OffloadingHandler):
         self.blocks_evicted: int = 0
         self.blocks_freed: int = 0
         self.blocks_allocated: int = 0
+        self.num_forced_syncs: int = 0  # Track how often we hit backpressure
 
         assert dest_block_size % src_block_size == 0
         self.block_size_factor = dest_block_size // src_block_size
@@ -94,6 +101,10 @@ class GpuGpuOffloadingHandler(OffloadingHandler):
             src_gpu_id: [],
             dest_gpu_id: [],
         }
+        # job_ids that were force-completed during backpressure sync
+        # these need to be returned by get_finished() on next call
+        # Use a SET to prevent duplicate job_ids if backpressure triggers multiple times
+        self.force_completed_jobs: set[int] = set()
 
         # allocate dest gpu tensors
         logger.info("Allocating %d secondary GPU tensors on cuda:%d...", 
@@ -146,6 +157,29 @@ class GpuGpuOffloadingHandler(OffloadingHandler):
             )
 
     def transfer_async(self, job_id: int, spec: TransferSpec) -> bool:
+        # BACKPRESSURE: Prevent CUDA queue overflow by syncing when too many pending
+        # Without this, async operations accumulate unbounded and can deadlock CUDA
+        if len(self.transfer_events) >= MAX_PENDING_TRANSFERS:
+            self.num_forced_syncs += 1
+            logger.warning(
+                f"[GPU Offload] Hit max pending transfers ({len(self.transfer_events)}/{MAX_PENDING_TRANSFERS}). "
+                f"Forcing synchronization (sync #{self.num_forced_syncs})..."
+            )
+            
+            # Force completion of all pending transfers
+            torch.cuda.synchronize()
+            
+            # CRITICAL: Save job_ids BEFORE clearing - they need to be returned
+            # by get_finished() so the scheduler knows they completed!
+            for jid, (event, device) in self.transfer_events.items():
+                self.force_completed_jobs.add(jid)  # Use add() for set
+                self.events_pool[device].append(event)
+            
+            num_completed = len(self.transfer_events)
+            self.transfer_events.clear()
+            
+            logger.info(f"[GPU Offload] Sync complete. {num_completed} jobs force-completed.")
+        
         src_spec, dst_spec = spec
         
         # Determine direction and update counters
@@ -236,12 +270,29 @@ class GpuGpuOffloadingHandler(OffloadingHandler):
 
     def get_finished(self) -> list[TransferResult]:
         results: list[TransferResult] = []
+        returned_job_ids: set[int] = set()  # Track to prevent duplicates
+        
+        # First, return any jobs that were force-completed during backpressure
+        for job_id in self.force_completed_jobs:
+            results.append((job_id, True))
+            returned_job_ids.add(job_id)
+        self.force_completed_jobs.clear()
+        
+        # Then check for normally completed jobs (skip if already returned)
         for job_id, (event, device) in self.transfer_events.items():
+            if job_id in returned_job_ids:
+                # Already returned via force_complete, just cleanup
+                self.events_pool[device].append(event)
+                continue
             if event.query():
                 results.append((job_id, True))
+                returned_job_ids.add(job_id)
                 self.events_pool[device].append(event)
-        for job_id, _ in results:
-            del self.transfer_events[job_id]
+        
+        # Remove completed jobs from transfer_events
+        for job_id in returned_job_ids:
+            if job_id in self.transfer_events:
+                del self.transfer_events[job_id]
         return results
 
     def get_offloading_stats(self) -> dict[str, int]:
@@ -251,6 +302,8 @@ class GpuGpuOffloadingHandler(OffloadingHandler):
             "blocks_allocated": self.blocks_allocated,
             "blocks_evicted": self.blocks_evicted,
             "blocks_freed": self.blocks_freed,
+            "num_forced_syncs": self.num_forced_syncs,
+            "pending_transfers": len(self.transfer_events),
         }
 
 

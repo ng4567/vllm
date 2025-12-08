@@ -17,6 +17,16 @@ from vllm.v1.kv_offload.worker.worker import (
 
 logger = init_logger(__name__)
 
+# Maximum number of pending async transfers before forcing synchronization
+# This prevents CUDA operation queue overflow that can cause hangs
+# NOTE: CPU offloading needs MUCH lower limit than GPU-to-GPU because:
+#   - PCIe transfers are slower than NVLink
+#   - Each transfer JOB contains MANY cudaMemcpyAsync calls (one per block)
+#   - With limit=100, 100 jobs × ~50 blocks = 5000+ CUDA ops → overflow!
+#   - Empirically: limit=100 still hung (sync triggered but too late)
+#   - Must sync FREQUENTLY to prevent CUDA operation queue overflow
+MAX_PENDING_TRANSFERS = 100  # Very aggressive - sync every 20 jobs
+
 
 def expand_block_ids(
     block_ids: np.ndarray,
@@ -66,6 +76,7 @@ class CpuGpuOffloadingHandler(OffloadingHandler):
         self.blocks_evicted: int = 0
         self.blocks_freed: int = 0
         self.blocks_allocated: int = 0
+        self.num_forced_syncs: int = 0  # Track how often we hit backpressure
 
         assert cpu_block_size % gpu_block_size == 0
         self.block_size_factor = cpu_block_size // gpu_block_size
@@ -78,6 +89,10 @@ class CpuGpuOffloadingHandler(OffloadingHandler):
         self.transfer_events: dict[int, torch.Event] = {}
         # list of cuda events available for re-use
         self.events_pool: list[torch.Event] = []
+        # job_ids that were force-completed during backpressure sync
+        # these need to be returned by get_finished() on next call
+        # Use a SET to prevent duplicate job_ids if backpressure triggers multiple times
+        self.force_completed_jobs: set[int] = set()
 
         pin_memory = is_pin_memory_available()
 
@@ -128,6 +143,28 @@ class CpuGpuOffloadingHandler(OffloadingHandler):
             )
 
     def transfer_async(self, job_id: int, spec: TransferSpec) -> bool:
+        # BACKPRESSURE: Prevent CUDA queue overflow by syncing when too many pending
+        if len(self.transfer_events) >= MAX_PENDING_TRANSFERS:
+            self.num_forced_syncs += 1
+            logger.warning(
+                f"[CPU Offload] Hit max pending transfers ({len(self.transfer_events)}/{MAX_PENDING_TRANSFERS}). "
+                f"Forcing synchronization (sync #{self.num_forced_syncs})..."
+            )
+            
+            # Force completion of all pending transfers
+            torch.cuda.synchronize()
+            
+            # CRITICAL: Save job_ids BEFORE clearing - they need to be returned
+            # by get_finished() so the scheduler knows they completed!
+            for job_id, event in self.transfer_events.items():
+                self.force_completed_jobs.add(job_id)  # Use add() for set
+                self.events_pool.append(event)
+            
+            num_completed = len(self.transfer_events)
+            self.transfer_events.clear()
+            
+            logger.info(f"[CPU Offload] Sync complete. {num_completed} jobs force-completed.")
+        
         src_spec, dst_spec = spec
         if isinstance(src_spec, CPULoadStoreSpec):
             assert isinstance(dst_spec, GPULoadStoreSpec)
@@ -175,7 +212,7 @@ class CpuGpuOffloadingHandler(OffloadingHandler):
         expand_block_ids(dst_blocks, dst_block_size_factor, src_to_dst[:, 1])
         src_to_dst_tensor = torch.from_numpy(src_to_dst)
 
-        event = self.events_pool.pop() if self.events_pool else torch.Event()
+        event = self.events_pool.pop() if self.events_pool else torch.cuda.Event()
         with torch.cuda.stream(stream):
             for src_tensor, dst_tensor, kv_dim in zip(
                 src_tensors, dst_tensors, self.kv_dim_before_num_blocks
@@ -198,12 +235,29 @@ class CpuGpuOffloadingHandler(OffloadingHandler):
 
     def get_finished(self) -> list[TransferResult]:
         results: list[TransferResult] = []
+        returned_job_ids: set[int] = set()  # Track to prevent duplicates
+        
+        # First, return any jobs that were force-completed during backpressure
+        for job_id in self.force_completed_jobs:
+            results.append((job_id, True))
+            returned_job_ids.add(job_id)
+        self.force_completed_jobs.clear()
+        
+        # Then check for normally completed jobs (skip if already returned)
         for job_id, event in self.transfer_events.items():
+            if job_id in returned_job_ids:
+                # Already returned via force_complete, just cleanup
+                self.events_pool.append(event)
+                continue
             if event.query():
                 results.append((job_id, True))
+                returned_job_ids.add(job_id)
                 self.events_pool.append(event)
-        for job_id, _ in results:
-            del self.transfer_events[job_id]
+        
+        # Remove completed jobs from transfer_events
+        for job_id in returned_job_ids:
+            if job_id in self.transfer_events:
+                del self.transfer_events[job_id]
         return results
 
     def get_offloading_stats(self) -> dict[str, int]:
@@ -214,4 +268,6 @@ class CpuGpuOffloadingHandler(OffloadingHandler):
             "blocks_allocated": self.blocks_allocated,
             "blocks_evicted": self.blocks_evicted,
             "blocks_freed": self.blocks_freed,
+            "num_forced_syncs": self.num_forced_syncs,
+            "pending_transfers": len(self.transfer_events),
         }
