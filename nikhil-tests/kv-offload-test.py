@@ -18,11 +18,11 @@ huggingface_api_key = os.getenv("hf_token")
 BLOCK_SIZE = 16 #vllm default block size
 DEST_GPU_ID = 1
 NUM_BLOCKS = 10000  # Default, will be updated per model
-NUM_TRIALS = 5
-NUM_PROMPTS = 8700 #number of prompts to take from the prompt set
+NUM_TRIALS = 10
+NUM_PROMPTS = 1000 #number of prompts to take from the prompt set
 MAX_TOKENS = 6000  # Global max tokens for all configs
-PROMPT_SET_NAMES = ["shared_prefix", "unique"] # ["unique", "shared_prefix"] # Prompt sets to test
-EVICTION_POLICIES = ["lru", "arc"] #"arc" List of eviction policies to test; each policy is run separately and reported separately.
+PROMPT_SET_NAMES = ["unique", "shared_prefix"] # ["unique", "shared_prefix"] # Prompt sets to test
+EVICTION_POLICIES = ["lru", "arc"] #["lru", "arc"] List of eviction policies to test; each policy is run separately and reported separately.
 TEST_GPU = True  # Whether to run GPU offloading tests
 TEST_CPU = True  # Whether to run CPU offloading tests
 
@@ -178,7 +178,7 @@ def calculate_gpu_mem_util(
     if model_name == "mistralai/Mistral-7B-Instruct-v0.1":
         return 0.3
     elif model_name == "facebook/opt-125m":
-        return 0.025  # 4%
+        return 0.028  # 4%
     
     raise ValueError(f"GPU memory utilization not set for model {model_name}")
     
@@ -644,7 +644,6 @@ def print_results() -> None:
 
         rows.append({
             "Model": model_name,
-            "Config": config_name,
             "Size": size_tier,
             "Prompts": "uniq" if prompt_set == "unique" else "shared",
             "Policy": policy,
