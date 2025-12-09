@@ -18,7 +18,7 @@ huggingface_api_key = os.getenv("hf_token")
 BLOCK_SIZE = 16 #vllm default block size
 DEST_GPU_ID = 1
 NUM_BLOCKS = 10000  # Default, will be updated per model
-NUM_TRIALS = 10
+NUM_TRIALS = 1
 NUM_PROMPTS = 1000 #number of prompts to take from the prompt set
 MAX_TOKENS = 6000  # Global max tokens for all configs
 PROMPT_SET_NAMES = ["unique", "shared_prefix"] # ["unique", "shared_prefix"] # Prompt sets to test
@@ -36,7 +36,7 @@ SIZE_TIERS = {
 }
 # Define models to test: model_name -> param_size_billions
 models = {
-    "facebook/opt-125m": 0.125,
+    #"facebook/opt-125m": 0.125,
     "mistralai/Mistral-7B-Instruct-v0.1": 7.0,
     #"deepseek-ai/DeepSeek-Coder-V2-Lite-Base": 16.0,
 }
@@ -178,7 +178,7 @@ def calculate_gpu_mem_util(
     if model_name == "mistralai/Mistral-7B-Instruct-v0.1":
         return 0.3
     elif model_name == "facebook/opt-125m":
-        return 0.028  # 4%
+        return 0.032
     
     raise ValueError(f"GPU memory utilization not set for model {model_name}")
     
@@ -453,6 +453,7 @@ def run_tests() -> None:
                     start = time.perf_counter()
                     llm_gpu.generate(prompts, sampling_params=SamplingParams(max_tokens=config["max_tokens"]))
                     config["runtime_gpu"].append(time.perf_counter() - start)
+                    gpu_stats = get_offloading_stats(llm_gpu) or {}
                     append_trial_row(
                         build_trial_row(
                             config_name=config_name,
@@ -460,12 +461,13 @@ def run_tests() -> None:
                             backend="gpu",
                             trial_index=i + 1,
                             runtime=config["runtime_gpu"][-1],
-                            stats={},
+                            stats=gpu_stats,
                             total_tokens=total_tokens,
                             offload_kv_capacity_gb=offload_kv_capacity_gb,
                         )
                     )
-                config["gpu_offloading_stats"].append(get_offloading_stats(llm_gpu))
+                # Save the latest stats for aggregate reporting
+                config["gpu_offloading_stats"].append(gpu_stats if gpu_stats else {})
             except Exception as e:
                 print(f"Error running test for config {config_name}: {e}")
                 if llm_gpu is not None:
@@ -496,6 +498,7 @@ def run_tests() -> None:
                     start = time.perf_counter()
                     llm_cpu.generate(prompts, sampling_params=SamplingParams(max_tokens=config["max_tokens"]))
                     config["runtime_cpu"].append(time.perf_counter() - start)
+                    cpu_stats = get_offloading_stats(llm_cpu) or {}
                     append_trial_row(
                         build_trial_row(
                             config_name=config_name,
@@ -503,12 +506,13 @@ def run_tests() -> None:
                             backend="cpu",
                             trial_index=i + 1,
                             runtime=config["runtime_cpu"][-1],
-                            stats={},
+                            stats=cpu_stats,
                             total_tokens=total_tokens,
                             offload_kv_capacity_gb=offload_kv_capacity_gb,
                         )
                     )
-                config["cpu_offloading_stats"].append(get_offloading_stats(llm_cpu))
+                # Save the latest stats for aggregate reporting
+                config["cpu_offloading_stats"].append(cpu_stats if cpu_stats else {})
             except Exception as e:
                     print(f"Error running test for config {config_name}: {e}")
                     if llm_cpu is not None:
