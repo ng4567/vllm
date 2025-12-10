@@ -1,0 +1,42 @@
+Results for policy=lru:
+Model                              Config Size   Prompts Policy MaxSeq AvgIn GPU_s  CPU_s  GPU_tok_s CPU_tok_s Compute_used_GB Dest_used_GB Offload_kv_capacity_GB GPU_mem_util Speedup_s Speedup_pct Offload Reload Trials
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+mistralai/Mistral-7B-Instruct-v0.1        xsmall uniq    lru    50     105   174.08 169.88 35069.33  35937.65  31.619219456    90.733740032 89.458                 0.3          -4.21     -2.5        52442   3      1     
+mistralai/Mistral-7B-Instruct-v0.1        xsmall shared  lru    50     80    74.14  73.13  82010.94  83139.63  31.68632832     90.733740032 89.458                 0.3          -1.01     -1.4        29325   124    1     
+mistralai/Mistral-7B-Instruct-v0.1        small  uniq    lru    100    105   218.62 166.72 27925.16  36617.26  31.68632832     90.733740032 89.458                 0.3          -51.9     -31.1       58260   2      1     
+mistralai/Mistral-7B-Instruct-v0.1        small  shared  lru    100    80    62.85  74.55  96732.58  81560.84  31.68632832     90.733740032 89.458                 0.3          11.69     15.7        27518   119    1     
+mistralai/Mistral-7B-Instruct-v0.1        medium uniq    lru    200    105   194.89 170.62 31325.1   35781.09  31.68632832     90.733740032 89.458                 0.3          -24.27    -14.2       54609   14     1     
+mistralai/Mistral-7B-Instruct-v0.1        medium shared  lru    200    80    79.56  80.25  76418.26  75767.86  31.68632832     90.733740032 89.458                 0.3          0.68      0.9         28622   115    1     
+mistralai/Mistral-7B-Instruct-v0.1        large  uniq    lru    300    105   218.93 162.58 27885.69  37550.83  31.68632832     90.733740032 89.458                 0.3          -56.35    -34.7       58260   2      1     
+mistralai/Mistral-7B-Instruct-v0.1        large  shared  lru    300    80    77.06  75.99  78901.86  80011.87  31.68632832     90.733740032 89.458                 0.3          -1.07     -1.4        29369   116    1     
+mistralai/Mistral-7B-Instruct-v0.1        xlarge uniq    lru    500    105   200.24 166.06 30488.7   36763.91  31.68632832     90.733740032 89.458                 0.3          -34.18    -20.6       55179   7      1     
+mistralai/Mistral-7B-Instruct-v0.1        xlarge shared  lru    500    80    65.7   80.85  92547.99  75197.19  31.68632832     90.733740032 89.458                 0.3          15.16     18.7        28125   131    1     
+
+Results for policy=arc:
+Model                              Config Size   Prompts Policy MaxSeq AvgIn GPU_s  CPU_s  GPU_tok_s CPU_tok_s Compute_used_GB Dest_used_GB Offload_kv_capacity_GB GPU_mem_util Speedup_s Speedup_pct Offload Reload Trials
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+mistralai/Mistral-7B-Instruct-v0.1        xsmall uniq    arc    50     105   167.71 170.14 36401.26  35881.92  31.68632832     90.733740032 89.458                 0.3          2.43      1.4         49961   4      1     
+mistralai/Mistral-7B-Instruct-v0.1        xsmall shared  arc    50     80    81.43  80.82  74661.01  75232.05  31.68632832     90.733740032 89.458                 0.3          -0.62     -0.8        29422   156    1     
+mistralai/Mistral-7B-Instruct-v0.1        small  uniq    arc    100    105   182.75 169.35 33405.94  36049.52  31.68632832     90.733740032 89.458                 0.3          -13.4     -7.9        52727   3      1     
+mistralai/Mistral-7B-Instruct-v0.1        small  shared  arc    100    80    79.79  60.01  76202.53  101314.35 31.68632832     90.733740032 89.458                 0.3          -19.78    -33.0       28622   115    1     
+mistralai/Mistral-7B-Instruct-v0.1        medium uniq    arc    200    105   205.31 179.87 29735.74  33942.05  31.68632832     90.733740032 89.458                 0.3          -25.44    -14.1       57412   9      1     
+mistralai/Mistral-7B-Instruct-v0.1        medium shared  arc    200    80    76.86  84.48  79102.68  71970.64  31.68632832     90.733740032 89.458                 0.3          7.62      9.0         30656   160    1     
+mistralai/Mistral-7B-Instruct-v0.1        large  uniq    arc    300    105   169.11 177.41 36099.88  34412.46  31.68632832     90.733740032 89.458                 0.3          8.29      4.7         50461   3      1     
+mistralai/Mistral-7B-Instruct-v0.1        large  shared  arc    300    80    85.14  77.11  71413.37  78852.7   31.68632832     90.733740032 89.458                 0.3          -8.03     -10.4       30643   107    1     
+mistralai/Mistral-7B-Instruct-v0.1        xlarge uniq    arc    500    105   196.15 169.56 31124.33  36005.31  31.68632832     90.733740032 89.458                 0.3          -26.59    -15.7       53503   8      1     
+mistralai/Mistral-7B-Instruct-v0.1        xlarge shared  arc    500    80    70.87  81.74  85793.77  74378.76  31.68632832     90.733740032 89.458                 0.3          10.88     13.3        28764   147    1     
+
+################################################################################
+SUMMARY
+################################################################################
+Total configs tested: 20
+Models: ['mistralai/Mistral-7B-Instruct-v0.1']
+Size tiers: ['xsmall', 'small', 'medium', 'large', 'xlarge']
+Prompt sets: ['unique', 'shared_prefix']
+Eviction policies: ['lru', 'arc']
+Trials per config: 1
+Max tokens: 6000
+################################################################################
+Per-trial rows streamed to /home/azureuser/vllm/nikhil-tests/results/20251209-205814.csv
+ERROR 12-09 23:11:51 [core_client.py:598] Engine core proc EngineCore_DP0 died unexpectedly, shutting down client.
+ERROR 12-09 23:12:16 [core_client.py:598] Engine core proc EngineCore_DP0 died unexpectedly, shutting down client.
