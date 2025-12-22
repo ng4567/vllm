@@ -1,0 +1,12 @@
+/expert-paralell-cpu 
+contains CGO pipe with expert paralellism
+still need mixtral, all others were fine
+
+expert paralellism ran with all to all backend: python -m fastmoe.serve.launch_server   --model-path mistralai/Mixtral-8x7B-Instruct-v0.1 --port 30000   --cpu-mem-bdw 76   --avg-prompt-len 77   --gen-len 32   --enable-expert-parallel   --all2all-backend allgather_reducescatter
+
+
+base vllm:
+all done, mixtral doesn't work because of OOM
+
+KV-Offloading:
+Results in KV-Offload Data, with and without pre-emption

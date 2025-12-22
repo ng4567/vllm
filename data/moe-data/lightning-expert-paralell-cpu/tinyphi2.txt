@@ -1,0 +1,10 @@
+Time: 13.581s
+Throughput: 10556.181 tokens/s
+Time: 13.297s
+Throughput: 10781.374 tokens/s
+Time: 13.614s
+Throughput: 10530.226 tokens/s
+Time: 13.703s
+Throughput: 10462.189 tokens/s
+Time: 13.422s
+Throughput: 10681.034 tokens/s
