@@ -518,6 +518,7 @@ class EngineArgs:
     )
     scheduling_policy: SchedulerPolicy = SchedulerConfig.policy
     scheduler_cls: str | type[object] | None = SchedulerConfig.scheduler_cls
+    preempt_after_tokens: int | None = SchedulerConfig.preempt_after_tokens
 
     pooler_config: PoolerConfig | None = ModelConfig.pooler_config
     compilation_config: CompilationConfig = get_field(VllmConfig, "compilation_config")
@@ -1059,6 +1060,9 @@ class EngineArgs:
         )
         scheduler_group.add_argument(
             "--stream-interval", **scheduler_kwargs["stream_interval"]
+        )
+        scheduler_group.add_argument(
+            "--preempt-after-tokens", **scheduler_kwargs["preempt_after_tokens"]
         )
 
         # Compilation arguments
@@ -1645,6 +1649,7 @@ class EngineArgs:
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
             stream_interval=self.stream_interval,
+            preempt_after_tokens=self.preempt_after_tokens,
         )
 
         if not model_config.is_multimodal_model and self.default_mm_loras:

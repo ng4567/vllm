@@ -25,13 +25,14 @@ PROMPT_SET_NAMES = ["shared_prefix", "unique"] # ["unique", "shared_prefix"] # P
 EVICTION_POLICIES = ["arc", "lru"] #["lru", "arc"] List of eviction policies to test; each policy is run separately and reported separately.
 TEST_GPU = True # Whether to run GPU offloading tests
 TEST_CPU = True  # Whether to run CPU offloading tests
+NUM_TOKENS_BEFORE_PREMPTION = 10
 
 # Size tiers: name -> max_num_sequences
 SIZE_TIERS = {
    "xsmall": 50,
    "small": 100,
     "medium": 200,
-   "large": 300,
+    "large": 300,
    "xlarge": 500,
 }
 # Define models to test: model_name -> param_size_billions
@@ -73,6 +74,7 @@ CSV_FIELDNAMES = [
     "num_gpu_blocks",
     "dest_gpu_id",
     "gpu_mem_util",
+    "preempt_after_tokens",
     "blocks_offloaded",
     "blocks_reloaded",
     "blocks_allocated",
@@ -351,6 +353,7 @@ def build_trial_row(
         "blocks_allocated": stats.get("blocks_allocated"),
         "blocks_evicted": stats.get("blocks_evicted"),
         "blocks_freed": stats.get("blocks_freed"),
+        "preempt_after_tokens": NUM_TOKENS_BEFORE_PREMPTION,
     }
     return row
 
@@ -433,6 +436,7 @@ def run_tests() -> None:
                         },
                     ),
                     gpu_memory_utilization=config["gpu_mem_util"],
+                    preempt_after_tokens=NUM_TOKENS_BEFORE_PREMPTION,
                 )
                     # Capture memory snapshot for compute and dest GPUs
                 compute_device = torch.cuda.current_device()
@@ -492,6 +496,7 @@ def run_tests() -> None:
                         },
                     ),
                     gpu_memory_utilization=config["gpu_mem_util"],
+                    preempt_after_tokens=NUM_TOKENS_BEFORE_PREMPTION,
                 )
 
                 for i in range(NUM_TRIALS):

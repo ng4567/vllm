@@ -121,6 +121,9 @@ class Request:
         # The number of requests being preempted by the scheduler
         self.num_preemptions = 0
 
+        # Token count at last rotation-based preemption (for time-slice scheduling)
+        self.tokens_at_last_rotation_preempt = 0
+
         # The number of tokens that have been computed remotely.
         self.num_external_computed_tokens = 0
 

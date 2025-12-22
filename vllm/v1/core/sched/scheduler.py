@@ -191,6 +191,88 @@ class Scheduler(SchedulerInterface):
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
 
+        # Token-based rotation preemption config
+        self.preempt_after_tokens = self.scheduler_config.preempt_after_tokens
+        if self.preempt_after_tokens is not None:
+            print(f"\n{'#'*70}")
+            print(f"# TOKEN-BASED ROTATION PREEMPTION ENABLED")
+            print(f"# Preempt threshold: {self.preempt_after_tokens} output tokens")
+            print(f"# Requests will be preempted and moved to waiting queue")
+            print(f"# KV cache will be freed - offloader will reload on resume")
+            print(f"{'#'*70}\n")
+            logger.info(
+                "Token-based rotation preemption enabled: preempt after %d tokens",
+                self.preempt_after_tokens,
+            )
+
+    def _perform_rotation_preemption(self) -> list[Request]:
+        """
+        Perform token-based rotation preemption for time-slice scheduling.
+        
+        This preempts running requests that have generated more than
+        `preempt_after_tokens` output tokens since their last rotation,
+        freeing their GPU KV cache and moving them to the waiting queue.
+        
+        When resumed, the KV offloader will reload their blocks from the
+        offload cache instead of recomputing.
+        
+        Returns:
+            List of preempted requests.
+        """
+        if self.preempt_after_tokens is None or self.preempt_after_tokens <= 0:
+            return []
+        
+        preempted_reqs: list[Request] = []
+        reqs_to_preempt: list[Request] = []
+        
+        # Find requests that have exceeded their token quota
+        for request in self.running:
+            tokens_since_rotation = (
+                request.num_output_tokens - request.tokens_at_last_rotation_preempt
+            )
+            if tokens_since_rotation >= self.preempt_after_tokens:
+                reqs_to_preempt.append(request)
+        
+        # Preempt them: free KV cache and move to waiting queue
+        for request in reqs_to_preempt:
+            self.running.remove(request)
+            
+            # Free the GPU KV cache (offloader has copies!)
+            self.kv_cache_manager.free(request)
+            self.encoder_cache_manager.free(request)
+            
+            # Update request state
+            request.status = RequestStatus.PREEMPTED
+            request.num_computed_tokens = 0
+            request.num_preemptions += 1
+            request.tokens_at_last_rotation_preempt = request.num_output_tokens
+            
+            # Add to waiting queue (will trigger offload lookup on resume)
+            self.waiting.add_request(request)
+            preempted_reqs.append(request)
+            
+            # DEBUG: Print preemption info
+            print(f"\n{'='*60}")
+            print(f"[ROTATION PREEMPT] Request: {request.request_id}")
+            print(f"  Output tokens generated: {request.num_output_tokens}")
+            print(f"  Preemption threshold: {self.preempt_after_tokens}")
+            print(f"  Total preemptions for this request: {request.num_preemptions}")
+            print(f"  GPU KV cache FREED - offloader should have copies")
+            print(f"  Moved to WAITING queue - will reload from offload on resume")
+            print(f"{'='*60}\n")
+            
+            logger.debug(
+                "Rotation preempt: request %s after %d output tokens",
+                request.request_id,
+                request.num_output_tokens,
+            )
+        
+        if preempted_reqs:
+            print(f"[ROTATION PREEMPT SUMMARY] Preempted {len(preempted_reqs)} request(s), "
+                  f"running={len(self.running)}, waiting={len(self.waiting)}")
+        
+        return preempted_reqs
+
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -203,10 +285,15 @@ class Scheduler(SchedulerInterface):
         # chunked prefills, prefix caching, speculative decoding,
         # and the "jump decoding" optimization in the future.
 
+        # Token-based rotation preemption: preempt requests that have
+        # exceeded their token quota and move them to waiting queue.
+        # This triggers KV offload/reload cycles for testing.
+        rotation_preempted = self._perform_rotation_preemption()
+
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
         scheduled_running_reqs: list[Request] = []
-        preempted_reqs: list[Request] = []
+        preempted_reqs: list[Request] = list(rotation_preempted)
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
@@ -601,6 +688,17 @@ class Scheduler(SchedulerInterface):
                     scheduled_new_reqs.append(request)
                 elif request.status == RequestStatus.PREEMPTED:
                     scheduled_resumed_reqs.append(request)
+                    # DEBUG: Print resume info
+                    print(f"\n{'='*60}")
+                    print(f"[ROTATION RESUME] Request: {request.request_id}")
+                    print(f"  Resuming from PREEMPTED state")
+                    print(f"  Output tokens so far: {request.num_output_tokens}")
+                    print(f"  External computed tokens (from offload): {num_external_computed_tokens}")
+                    print(f"  Local computed tokens (GPU cache hit): {num_computed_tokens - num_external_computed_tokens}")
+                    print(f"  Total preemptions: {request.num_preemptions}")
+                    if num_external_computed_tokens > 0:
+                        print(f"  >>> OFFLOADER HIT! Loading {num_external_computed_tokens} tokens from offload cache")
+                    print(f"{'='*60}\n")
                 else:
                     raise RuntimeError(f"Invalid request status: {request.status}")
 

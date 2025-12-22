@@ -141,6 +141,12 @@ class SchedulerConfig:
     while a larger value (e.g., 10) reduces host overhead and may increase throughput
     by batching multiple tokens before sending."""
 
+    preempt_after_tokens: int | None = 32
+    """If set, preempt running requests after generating this many output tokens
+    and move them to the back of the waiting queue. This implements time-slice
+    scheduling for fair resource sharing. Useful for testing KV cache offloading
+    as it forces offload/reload cycles. Set to None or 0 to disable."""
+
     def get_scheduler_cls(self) -> type["SchedulerInterface"]:
         if self.scheduler_cls is None:
             if self.async_scheduling:
