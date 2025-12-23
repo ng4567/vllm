@@ -10,3 +10,5 @@ all done, mixtral doesn't work because of OOM
 
 KV-Offloading:
 Results in KV-Offload Data, with and without pre-emption
+
+Collect the premption data with the following command: python preempt-offload-test.py
