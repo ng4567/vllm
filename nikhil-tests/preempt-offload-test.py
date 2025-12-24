@@ -21,23 +21,23 @@ NUM_BLOCKS = 10000  # Default, will be updated per model
 NUM_TRIALS = 1
 NUM_PROMPTS = 1000 #number of prompts to take from the prompt set
 MAX_TOKENS = 6000  # Global max tokens for all configs
-PROMPT_SET_NAMES = ["shared_prefix", "unique"] # ["unique", "shared_prefix"] # Prompt sets to test
-EVICTION_POLICIES = ["arc", "lru"] #["lru", "arc"] List of eviction policies to test; each policy is run separately and reported separately.
+PROMPT_SET_NAMES = ["unique"] # ["unique", "shared_prefix"] # Prompt sets to test
+EVICTION_POLICIES = ["lru", 'arc'] #["lru", "arc"] List of eviction policies to test; each policy is run separately and reported separately.
 TEST_GPU = True # Whether to run GPU offloading tests
 TEST_CPU = True  # Whether to run CPU offloading tests
-NUM_TOKENS_BEFORE_PREMPTION = 10
+NUM_TOKENS_BEFORE_PREMPTION = 20
 
 # Size tiers: name -> max_num_sequences
 SIZE_TIERS = {
-   "xsmall": 50,
-   "small": 100,
+   #"xsmall": 50,
+   #"small": 100,
     "medium": 200,
     "large": 300,
    "xlarge": 500,
 }
 # Define models to test: model_name -> param_size_billions
 models = {
-    "facebook/opt-125m": 0.125,
+    #"facebook/opt-125m": 0.125,
     "mistralai/Mistral-7B-Instruct-v0.1": 7.0,
     #"deepseek-ai/DeepSeek-Coder-V2-Lite-Base": 16.0,
 }
