@@ -1,0 +1,16 @@
+model,run,runtime_s,throughput_tokens_s,num_prompts,max_new_tokens,num_finished,success
+Qwen/Qwen1.5-MoE-A2.7B,1,5.05,28389.71,4480,32,1585,True
+Qwen/Qwen1.5-MoE-A2.7B,2,4.737,30267.059,4480,32,1624,True
+Qwen/Qwen1.5-MoE-A2.7B,3,4.631,30958.962,4480,32,1582,True
+Qwen/Qwen1.5-MoE-A2.7B,4,4.662,30748.271,4480,32,1611,True
+Qwen/Qwen1.5-MoE-A2.7B,5,4.568,31383.177,4480,32,1582,True
+microsoft/Phi-tiny-MoE-instruct,1,5.707,25119.726,4480,32,3360,True
+microsoft/Phi-tiny-MoE-instruct,2,5.631,25459.529,4480,32,3360,True
+microsoft/Phi-tiny-MoE-instruct,3,5.58,25692.709,4480,32,3360,True
+microsoft/Phi-tiny-MoE-instruct,4,5.586,25664.299,4480,32,3360,True
+microsoft/Phi-tiny-MoE-instruct,5,5.598,25611.323,4480,32,3360,True
+microsoft/Phi-3.5-MoE-instruct,1,18.79,7629.415,4480,32,3976,True
+microsoft/Phi-3.5-MoE-instruct,2,18.696,7667.899,4480,32,3977,True
+microsoft/Phi-3.5-MoE-instruct,3,18.949,7565.456,4480,32,3976,True
+microsoft/Phi-3.5-MoE-instruct,4,19.322,7419.545,4480,32,3976,True
+microsoft/Phi-3.5-MoE-instruct,5,19.376,7398.663,4480,32,3976,True

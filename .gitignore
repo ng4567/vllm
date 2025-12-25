@@ -195,7 +195,7 @@ AGENTS.md
 .DS_Store
 
 # Results
-*.csv
+#*.csv
 
 # Python pickle files
 *.pkl
@@ -229,3 +229,4 @@ ep_kernels_workspace/
 !vllm/benchmarks/lib/
 
 tools/
+nikhil-tests/results/
